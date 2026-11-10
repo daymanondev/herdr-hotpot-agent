@@ -8,6 +8,7 @@
 //! runtime coordinator's append-only state) is preserve-only — never planned, never written.
 
 use crate::contracts::RenderedContracts;
+use crate::hygiene;
 use crate::role_homes;
 use serde_json::json;
 use std::env;
@@ -479,18 +480,21 @@ pub fn guard_removal_root(home: &Path) -> Result<(), PlanError> {
 }
 
 /// Builds the base Hotpot Home plan: the home skeleton directories, the nine Role Homes
-/// (vendor configs + additive instruction artifacts, via [`role_homes::seat_plan_items`]),
-/// `AUTHENTICATION.md`, and the `hotpot.json` marker carrying the role-contract digest and
-/// runtime opt-in state. `runtime/` is never part of a plan (preserve-only); `hc` profile
-/// changes are only planned when `hc` is discoverable on `PATH`. Later tickets plug hygiene
-/// and skill-projection generators into this same [`Plan`].
+/// (vendor configs + additive instruction artifacts + Capability Hygiene closures, via
+/// [`role_homes::seat_plan_items`]), `AUTHENTICATION.md`, and the `hotpot.json` marker
+/// carrying the role-contract digest and runtime opt-in state. `runtime/` is never part of a
+/// plan (preserve-only); `hc` profile changes are only planned when `hc` is discoverable on
+/// `PATH`. Fails closed when the operator's Codex model catalog cannot be produced scrubbed
+/// ([`hygiene::operator_codex_catalog`]). Later tickets plug skill-projection generators into
+/// this same [`Plan`].
 pub fn base_home_plan(
     home: &Path,
     hotpot_bin: &Path,
     contracts: &RenderedContracts,
     runtime_opt_in: bool,
     hc_available: bool,
-) -> Plan {
+) -> Result<Plan, PlanError> {
+    let codex_catalog = hygiene::scrubbed_catalog_contents(&hygiene::operator_codex_catalog()?);
     let mut items: Vec<PlanItem> = Vec::new();
     for agent in AGENTS {
         for role in ROLES {
@@ -501,6 +505,7 @@ pub fn base_home_plan(
                 agent,
                 role,
                 contracts.for_role(role),
+                &codex_catalog,
             ));
         }
     }
@@ -525,8 +530,8 @@ pub fn base_home_plan(
             value: "true".to_string(),
         });
     }
-    Plan {
+    Ok(Plan {
         home: home.to_path_buf(),
         items,
-    }
+    })
 }

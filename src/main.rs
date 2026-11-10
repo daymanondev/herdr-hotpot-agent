@@ -2,6 +2,7 @@ pub mod auth;
 pub mod contracts;
 pub mod guard;
 pub mod hc;
+pub mod hygiene;
 pub mod inspector;
 pub mod provisioner;
 pub mod role_homes;
@@ -275,10 +276,31 @@ fn cmd_mcp(args: &[String]) {
 
 /// `hotpot setup [--apply]`: dry-run desired-state planning over Hotpot Home by default;
 /// `--apply` materializes exactly the planned set (nine Role Homes with their vendor configs,
-/// additive role contracts, `AUTHENTICATION.md`, and the `hotpot.json` marker).
+/// additive role contracts, hygiene closures, `AUTHENTICATION.md`, and the `hotpot.json`
+/// marker). Both modes first run the Capability Hygiene gate
+/// ([`hygiene::run_checks`] in [`hygiene::CheckMode::PreApply`]) and fail closed — nothing
+/// applied, nothing printed — when existing seat state violates the closures or an operator
+/// MCP config wires an orchestration backdoor.
 fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
     let apply = args.iter().any(|a| a == "--apply");
     let home = resolve_hotpot_home()?;
+    let failures: Vec<_> = hygiene::run_checks(&home, hygiene::CheckMode::PreApply)
+        .into_iter()
+        .filter(|result| !result.ok)
+        .collect();
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("{}", failure.render());
+        }
+        return Err(PlanError::new(
+            "hygiene-gate",
+            format!(
+                "{} capability-hygiene check(s) failed; refusing to touch Hotpot Home \
+                 (run `hotpot verify` for the full report)",
+                failures.len()
+            ),
+        ));
+    }
     let contracts = RenderedContracts::from_env();
     let runtime_opt_in = runtime_opt_in_from_env();
     let hotpot_bin = env::current_exe().map_err(|e| {
@@ -291,7 +313,7 @@ fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
         &contracts,
         runtime_opt_in,
         hc_available,
-    );
+    )?;
     plan.validate()?;
 
     let stdout = io::stdout();
@@ -302,6 +324,32 @@ fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
         return Ok(());
     }
     plan.apply(&mut out)
+}
+
+/// `hotpot verify`: runs every Capability Hygiene check ([`hygiene::run_checks`]) over the
+/// Hotpot Home and the read-only operator inputs. Exits 0 with a per-check report on stdout
+/// when all closures hold; exits non-zero naming each failing check on stderr otherwise.
+fn cmd_verify() -> Result<(), PlanError> {
+    let home = resolve_hotpot_home()?;
+    let results = hygiene::run_checks(&home, hygiene::CheckMode::Verify);
+    let mut failed = 0usize;
+    for result in &results {
+        if result.ok {
+            println!("{}", result.render());
+        } else {
+            eprintln!("{}", result.render());
+            failed += 1;
+        }
+    }
+    if failed == 0 {
+        println!("verify: all checks passed ({} ok)", results.len());
+        Ok(())
+    } else {
+        Err(PlanError::new(
+            "verify-failed",
+            format!("{failed} capability-hygiene check(s) failed"),
+        ))
+    }
 }
 
 /// `hotpot remove [--apply]`: dry-run lists planned deletions and warns about role-owned
@@ -405,6 +453,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "verify" => {
+            if let Err(err) = cmd_verify() {
+                eprintln!("hotpot: {err}");
+                std::process::exit(1);
+            }
+        }
         "remove" => {
             if let Err(err) = cmd_remove(&args[2..]) {
                 eprintln!("hotpot: {err}");
@@ -414,7 +468,7 @@ fn main() {
         "auth" => cmd_auth(&args[2..]),
         "--help" | "-h" | "help" => {
             println!("hotpot 0.1.0 — Rust SLP verification engine & session inspector for Herdr");
-            println!("Commands: status, inspect, hook, mcp, setup [--apply], remove [--apply],");
+            println!("Commands: status, inspect, hook, mcp, setup [--apply], verify, remove [--apply],");
             println!("           auth login <codex|claude|pi> <supervisor|lead|peer>");
         }
         _ => cmd_status(&args[1..]),
