@@ -118,9 +118,24 @@ pub(crate) fn preserve_credential_shape(role_home: &Path, agent: &str) -> Result
     let Some(shape) = credential_shape(&credential) else {
         return Ok(());
     };
+    crate::provisioner::atomic_write_file(
+        &role_home.join(PRESERVED_SHAPE_FILE),
+        &preserved_shape_record(&shape),
+    )
+}
+
+/// Renders one shape as the [`PRESERVED_SHAPE_FILE`] record contents (pretty-printed with
+/// a trailing newline): byte length plus recursive key names — never any token value.
+fn preserved_shape_record(shape: &CredentialShape) -> String {
     let record = json!({ "len": shape.len, "keys": shape.keys });
-    let contents = serde_json::to_string_pretty(&record).unwrap() + "\n";
-    crate::provisioner::atomic_write_file(&role_home.join(PRESERVED_SHAPE_FILE), &contents)
+    serde_json::to_string_pretty(&record).unwrap() + "\n"
+}
+
+/// The sidecar record contents for one credential text (the shape of the bytes a seeding
+/// step is about to copy, computed before they land in the Role Home) — the same record
+/// [`preserve_credential_shape`] writes after a successful `hotpot auth login`.
+pub(crate) fn preserved_shape_contents(credential_text: &str) -> String {
+    preserved_shape_record(&shape_of_text(credential_text))
 }
 
 // ---------------------------------------------------------------------------

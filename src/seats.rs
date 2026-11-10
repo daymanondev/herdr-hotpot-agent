@@ -282,6 +282,14 @@ pub fn launch_seat(
             ),
         ));
     }
+
+    // On-demand credential seeding (the same rules `hotpot setup` applies): a seat whose
+    // credential is still missing inherits an independent copy of the operator's
+    // file-backed credential before the vendor terminal starts, so it authenticates
+    // immediately. The operator's HOME is a read-only input.
+    let operator_home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    crate::credential_seeding::seed_seat_credential(home, &operator_home, agent, role)?;
+
     let vendor_bin = find_on_path(agent).ok_or_else(|| {
         PlanError::new(
             "vendor-not-found",
