@@ -201,6 +201,17 @@ export const PRESET_PROFILES = {
 
 export const PRESET_NAMES = Object.keys(PRESET_PROFILES);
 
+/** The header preset dropdown's menu model: the named room presets the panel
+ * offers, each under the stable id its menu row renders with. The compact
+ * dropdown in the panel header is the presets' only surface — no fixed-width
+ * middle section truncates the names. */
+export function presetMenu() {
+  return PRESET_NAMES.map((name) => ({
+    id: name.replace(/\s+/g, "-").toLowerCase(),
+    name,
+  }));
+}
+
 function ensurePillValue(value, allowed, label) {
   if (!allowed.includes(value)) {
     throw new Error(`invalid ${label} \`${value}\`: permitted values are ${allowed.join("|")}`);
@@ -344,32 +355,34 @@ function seatSlot(role, snapshot) {
 /** The child Peer rows attached under Lead: every peer seat joined with its
  * assignment record (matched by assignment id) so each row carries the
  * assignment, disposition, gate verdict, attempt, and terminal alongside the
- * seat's own agent/model/thinking/status. */
+ * seat's own agent/model/thinking/status. Each row also carries its tree
+ * connector — `├` for every non-last child, `└` for the last — mirroring
+ * Herdr's native sub-agent tree. */
 function peerRows(snapshot) {
   const seats = Array.isArray(snapshot?.seats) ? snapshot.seats : [];
   const tasks = Array.isArray(snapshot?.tasks) ? snapshot.tasks : [];
-  return seats
-    .filter((s) => s && s.role === "peer")
-    .map((seat) => {
-      const assignment = seat.assignment ?? null;
-      const task = assignment
-        ? (tasks.find((t) => t && t.id === assignment) ?? null)
-        : null;
-      return {
-        id: seat.id ?? null,
-        role: "peer",
-        assignment,
-        disposition: task?.disposition ?? null,
-        gate: task?.verdict ?? null,
-        attempt: task?.attempt ?? null,
-        terminal: pick(seat.terminal, task?.terminal),
-        agent: seat.agent ?? null,
-        model: seat.model ?? null,
-        thinking: seat.thinking ?? null,
-        status: seat.status ?? null,
-        seat,
-      };
-    });
+  const peers = seats.filter((s) => s && s.role === "peer");
+  return peers.map((seat, index) => {
+    const assignment = seat.assignment ?? null;
+    const task = assignment
+      ? (tasks.find((t) => t && t.id === assignment) ?? null)
+      : null;
+    return {
+      id: seat.id ?? null,
+      role: "peer",
+      connector: index === peers.length - 1 ? "└" : "├",
+      assignment,
+      disposition: task?.disposition ?? null,
+      gate: task?.verdict ?? null,
+      attempt: task?.attempt ?? null,
+      terminal: pick(seat.terminal, task?.terminal),
+      agent: seat.agent ?? null,
+      model: seat.model ?? null,
+      thinking: seat.thinking ?? null,
+      status: seat.status ?? null,
+      seat,
+    };
+  });
 }
 
 /** The panel's Seat Slot model over one `hotpot status` snapshot: the
@@ -384,4 +397,65 @@ export function seatSlotsModel(snapshot) {
   }
   model.lead.peers = peerRows(snapshot);
   return model;
+}
+
+// ---------------------------------------------------------------------------
+// Panel restructure: Quiet When Quiet, Start, preset menu, peer tree
+// (ticket nui/05)
+// ---------------------------------------------------------------------------
+
+/** The Quiet When Quiet section model over one snapshot: which panel sections
+ * render, fold, or hide. `attention` collapses to the single `All clear`
+ * indicator while quiet; `activity` (the live mailbox) hides entirely while
+ * empty; `assignments` folds to its one-line header (`Assignments  0`) while
+ * empty. `seats` always renders — its count covers the two always-present
+ * slots plus their child peers. Pure and total over any snapshot shape. */
+export function sectionVisibility(snapshot) {
+  const attention = attentionView(snapshot);
+  const tasks = Array.isArray(snapshot?.tasks) ? snapshot.tasks : [];
+  const mailbox = Array.isArray(snapshot?.mailbox) ? snapshot.mailbox : [];
+  const peers = seatSlotsModel(snapshot).lead.peers;
+  return {
+    attention: { quiet: attention.quiet, count: attention.items.length },
+    seats: { count: peers.length + 2 },
+    assignments: { folded: tasks.length === 0, count: tasks.length },
+    activity: { hidden: mailbox.length === 0, count: mailbox.length },
+  };
+}
+
+// `hotpot setup --apply` materializes the whole desired state (nine Role Homes,
+// contracts, skill projections, the marker file), which can far outlast the
+// panel's default 5s exec budget — the Start sequence grants it a longer one.
+export const SETUP_APPLY_TIMEOUT_MS = 120000;
+
+/** The argv of the provisioning pass: `hotpot setup --apply`. */
+export function setupApplyArgs() {
+  return ["setup", "--apply"];
+}
+
+/** The argv that launches one seat's `hc` terminal:
+ * `hotpot seat launch <role> --agent <agent> --project <folder>`. Unknown
+ * roles, unverified agent families, and empty project folders throw before any
+ * process is spawned. */
+export function seatLaunchArgs(role, agent, project) {
+  ensurePillValue(role, PROFILE_ROLES, "role");
+  ensurePillValue(agent, AGENT_OPTIONS, "agent");
+  if (typeof project !== "string" || project.trim() === "") {
+    throw new Error(`invalid project \`${project}\`: a non-empty project folder is required`);
+  }
+  return ["seat", "launch", role, "--agent", agent, "--project", project];
+}
+
+/** The exec sequence the inline `Start` action on an unlaunched slot runs:
+ * provision Hotpot Home first when the snapshot says the Project is not
+ * provisioned, then launch the seat with the role's configured profile agent.
+ * Each step carries its argv and the exec timeout it needs (`null` for the
+ * default). A slot with no configured agent throws before anything execs. */
+export function startSlotSteps(slot, snapshot, project) {
+  const steps = [];
+  if (snapshot?.provisioned === false) {
+    steps.push({ args: setupApplyArgs(), timeoutMs: SETUP_APPLY_TIMEOUT_MS });
+  }
+  steps.push({ args: seatLaunchArgs(slot.role, slot.agent, project), timeoutMs: null });
+  return steps;
 }
