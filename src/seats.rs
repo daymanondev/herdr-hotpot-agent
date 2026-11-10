@@ -200,6 +200,93 @@ fn seat_argv(
     argv
 }
 
+/// The best-effort delivery report of a `--prompt` directive (ticket nui/04).
+#[derive(Debug)]
+pub struct PromptDispatch {
+    /// The terminal the directive was addressed to, when one was resolved.
+    pub target: Option<String>,
+    /// Whether `hc send` accepted the directive.
+    pub delivered: bool,
+    /// Honest failure reason when `delivered` is false.
+    pub reason: Option<String>,
+}
+
+/// Delivers the `--prompt` directive of `hotpot seat launch` after a launch or
+/// reuse (ticket nui/04): the directive is recorded first as a durable
+/// `message_to_lead` mailbox event (from the Human, `to` the seat — the
+/// projection `hotpot status` serves), then sent into the seat's terminal via
+/// `hc send`, best-effort and honestly reported. A reused Lead is addressed by
+/// its terminal address; a fresh terminal is resolved from the `hc` listing by
+/// the launch's canonical correlation labels.
+pub fn dispatch_prompt(
+    home: &Path,
+    slug: &str,
+    role: &str,
+    agent: &str,
+    binding: &Option<PeerBinding>,
+    outcome: &LaunchOutcome,
+    prompt: &str,
+) -> Result<PromptDispatch, PlanError> {
+    let correlation = launch_correlation(agent, role, binding);
+    let ledger = crate::runtime::Ledger::at(
+        home.join("runtime")
+            .join("v1")
+            .join(slug)
+            .join("ledger.jsonl"),
+    );
+    ledger.ensure_parent_dir().map_err(|e| {
+        PlanError::new("io", format!("failed to record the directive: {e}"))
+    })?;
+    // A peer directive addresses the assignment-scoped correlation (the seat's
+    // identity); the single-seat roles are addressed by role name.
+    let to = match role {
+        "peer" => correlation.as_str(),
+        other => other,
+    };
+    ledger
+        .append(json!({
+            "type": "message_to_lead",
+            "from": "human",
+            "to": to,
+            "message": prompt,
+            "seat": correlation,
+        }))
+        .map_err(|e| PlanError::new("io", format!("failed to record the directive: {e}")))?;
+
+    let target = match outcome {
+        LaunchOutcome::Reused { address } => Some(address.clone()),
+        LaunchOutcome::Launched => hc::list_terminals()
+            .into_iter()
+            .find(|t| {
+                t.label(LABEL_V1) == Some("true")
+                    && t.label("hotpot.project") == Some(slug)
+                    && t.label("hotpot.correlation") == Some(correlation.as_str())
+            })
+            .map(|t| t.address),
+    };
+    let Some(target) = target else {
+        return Ok(PromptDispatch {
+            target: None,
+            delivered: false,
+            reason: Some(
+                "no hc terminal carries this launch's correlation labels".to_string(),
+            ),
+        });
+    };
+    match hc::send_terminal_prompt(&target, prompt) {
+        Ok(()) => Ok(PromptDispatch {
+            target: Some(target),
+            delivered: true,
+            reason: None,
+        }),
+        Err(reason) => Ok(PromptDispatch {
+            target: Some(target),
+            delivered: false,
+            reason: Some(reason),
+        }),
+    }
+}
+
 /// Launches (or reuses) one seat's `hc` terminal for the Project at `project_root`:
 ///
 /// - every launch validates the role/agent pair and the peer-only binding,
@@ -282,6 +369,14 @@ pub fn launch_seat(
             ),
         ));
     }
+
+    // On-demand credential seeding (the same rules `hotpot setup` applies): a seat whose
+    // credential is still missing inherits an independent copy of the operator's
+    // file-backed credential before the vendor terminal starts, so it authenticates
+    // immediately. The operator's HOME is a read-only input.
+    let operator_home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    crate::credential_seeding::seed_seat_credential(home, &operator_home, agent, role)?;
+
     let vendor_bin = find_on_path(agent).ok_or_else(|| {
         PlanError::new(
             "vendor-not-found",

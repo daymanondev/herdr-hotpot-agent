@@ -23,6 +23,42 @@ pub const PROFILES_FILE: &str = "profiles.json";
 /// status projection reads).
 pub const PROFILE_ROLES: &[&str] = &["supervisor", "lead", "peer"];
 
+/// One built-in role default: the fallback `agent` / `model` / `thinking`
+/// every unset `profiles.json` field resolves to, so the always-present Seat
+/// Slots of the Herdr panel render a concrete profile even on a fresh Project.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinProfile {
+    pub role: &'static str,
+    pub agent: &'static str,
+    pub model: &'static str,
+    pub thinking: &'static str,
+}
+
+/// The single source of the built-in role defaults (ticket nui/01): one
+/// constant both the Rust resolver and the JS fixtures name, mirroring the
+/// panel's *Deep Architecture* room preset (`shared/protocol.js:
+/// PRESET_PROFILES`) as the out-of-the-box posture.
+pub const BUILTIN_ROLE_PROFILES: &[BuiltinProfile] = &[
+    BuiltinProfile {
+        role: "supervisor",
+        agent: "claude",
+        model: "claude-opus-4-6",
+        thinking: "high",
+    },
+    BuiltinProfile {
+        role: "lead",
+        agent: "codex",
+        model: "gpt-5.1-codex",
+        thinking: "high",
+    },
+    BuiltinProfile {
+        role: "peer",
+        agent: "codex",
+        model: "gpt-5.1-codex",
+        thinking: "medium",
+    },
+];
+
 /// Validates a `profile set` payload and merges it into
 /// `<home>/profiles.json`, writing the result atomically. The merge preserves
 /// every other role entry and every unknown field of the addressed role; an
@@ -129,6 +165,31 @@ mod tests {
             let err = set(&home, agent, role, model, thinking)
                 .expect_err("invalid payload must fail closed");
             assert!(!home.join(PROFILES_FILE).exists(), "nothing written for {err}");
+        }
+    }
+
+    #[test]
+    fn builtin_role_profiles_cover_every_role_with_permitted_values() {
+        let roles: Vec<&str> = BUILTIN_ROLE_PROFILES.iter().map(|p| p.role).collect();
+        assert_eq!(roles, Vec::from(PROFILE_ROLES), "exactly the profile roles");
+        for profile in BUILTIN_ROLE_PROFILES {
+            assert!(
+                AGENT_FAMILIES.contains(&profile.agent),
+                "{} agent `{}` is a verified family",
+                profile.role,
+                profile.agent
+            );
+            assert!(
+                THINKING_EFFORTS.contains(&profile.thinking),
+                "{} thinking `{}` is a permitted effort",
+                profile.role,
+                profile.thinking
+            );
+            assert!(
+                !profile.model.trim().is_empty(),
+                "{} model is a concrete name",
+                profile.role
+            );
         }
     }
 }

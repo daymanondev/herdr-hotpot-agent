@@ -1,5 +1,6 @@
 //! CLI-level integration tests for `hc` seat launching & the 1:1 Project topology (ticket 06
-//! of the Hotpot Foundation spec).
+//! of the Hotpot Foundation spec), plus the UI-facing CLI surfaces of the Native Herdr UI
+//! spec (ticket nui/04): `hotpot attention feedback` and `hotpot seat launch --prompt`.
 //!
 //! Seam (per `.scratch/hotpot-foundation/spec.md` "Testing Decisions → Highest-Level Testing
 //! Seam" and ticket 06 "Testing seam"): invoke the `hotpot seat launch` binary against a
@@ -12,6 +13,7 @@
 mod common;
 
 use common::{TempDir, init_git_repo};
+use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -98,12 +100,19 @@ impl LaunchFixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_with_env(args, &[])
+    }
+
+    /// Runs the binary with extra environment pairs (the injectable seams the
+    /// nui/04 slices ride on, e.g. the `HOTPOT_NOW` clock pin).
+    fn run_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
         run_hotpot(
             self.home.path(),
             self.operator_home.path(),
             self.bin.path(),
             self.hc_state.path(),
             args,
+            envs,
         )
     }
 
@@ -122,7 +131,8 @@ impl LaunchFixture {
 }
 
 /// The fake `hc`: `hc run ...` records its full argv as one unit-separator-separated line
-/// appended to `<state>/create.log`; `hc ls --json` prints the scripted `<state>/list.json`;
+/// appended to `<state>/create.log`; `hc send ...` records its argv (leading `send` word
+/// kept) to `<state>/send.log`; `hc ls --json` prints the scripted `<state>/list.json`;
 /// anything else (e.g. `hc profile set ...` from `setup`) succeeds without side effects.
 /// The state dir rides on `HOTPOT_FAKE_HC_STATE`, inherited from the `hotpot` process.
 fn write_fake_hc(bin_dir: &Path) {
@@ -132,6 +142,7 @@ state=\"$HOTPOT_FAKE_HC_STATE\"\n\
 case \"$1\" in\n\
   ls) exec cat \"$state/list.json\" ;;\n\
   run) { for a in \"$@\"; do printf '\\037%s' \"$a\"; done; printf '\\n'; } >> \"$state/create.log\" ;;\n\
+  send) shift; { printf 'send'; for a in \"$@\"; do printf '\\037%s' \"$a\"; done; printf '\\n'; } >> \"$state/send.log\" ;;\n\
 esac\n\
 exit 0\n";
     let shim = bin_dir.join("hc");
@@ -147,12 +158,31 @@ fn write_fake_vendor(bin_dir: &Path, vendor: &str) {
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A fake `hc` whose `run` fails after printing `stderr_line` (so the launch path's
+/// diagnostics can be asserted against real stderr text); `ls` stays scripted from
+/// `<state>/list.json` like the default fake.
+fn write_failing_run_hc(bin_dir: &Path, stderr_line: &str) {
+    let script = format!(
+        "#!/bin/sh\n\
+         state=\"$HOTPOT_FAKE_HC_STATE\"\n\
+         case \"$1\" in\n\
+           ls) exec cat \"$state/list.json\" ;;\n\
+           run) echo {stderr_line:?} >&2 ; exit 1 ;;\n\
+         esac\n\
+         exit 0\n"
+    );
+    let shim = bin_dir.join("hc");
+    fs::write(&shim, script).unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn run_hotpot(
     home: &Path,
     fake_home: &Path,
     fake_bin: &Path,
     hc_state: &Path,
     args: &[&str],
+    envs: &[(&str, &str)],
 ) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hotpot"))
         .args(args)
@@ -160,6 +190,7 @@ fn run_hotpot(
         .env("HOME", fake_home)
         .env("HOTPOT_FAKE_HC_STATE", hc_state)
         .env("PATH", sandbox_path(fake_bin))
+        .envs(envs.iter().copied())
         .output()
         .unwrap()
 }
@@ -776,5 +807,585 @@ fn lead_launch_never_reuses_an_archived_lead_terminal() {
     assert!(
         stdout.contains("launched"),
         "stdout reports a launch, not a reuse: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ticket nui/04 — `hotpot attention feedback` CLI + `hotpot seat launch --prompt`
+//
+// Seam (ticket "Testing seam"): the built `hotpot` binary against this file's
+// temporary `HOTPOT_HOME`, temporary git repository, and fake-`hc` harness —
+// asserting ledger events on disk, the fake's recorded `hc send` argv, and
+// subsequent `hotpot status` JSON. The panel's Ack (useful) / Dismiss (noisy)
+// vocabulary maps onto the runtime's existing feedback actions.
+// ---------------------------------------------------------------------------
+
+/// A fixed "now" for the injectable clock (`HOTPOT_NOW`): every fixture event is
+/// stamped far in the past, so the five-minute stall mark is exact.
+const NOW: u64 = 1_700_000_000;
+
+/// The project ledger path under this fixture's Hotpot Home.
+fn project_ledger_path(fixture: &LaunchFixture) -> PathBuf {
+    fixture
+        .home
+        .path()
+        .join("runtime")
+        .join("v1")
+        .join(expected_slug(&fixture.repo))
+        .join("ledger.jsonl")
+}
+
+/// Writes fixture ledger events in one write, stamping explicit `seq`/`ts`
+/// values the way the engine's append would.
+fn seed_project_ledger(fixture: &LaunchFixture, events: &[Value]) {
+    let path = project_ledger_path(fixture);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut lines = String::new();
+    for (index, event) in events.iter().enumerate() {
+        let mut event = event.clone();
+        event["seq"] = json!((index + 1) as u64);
+        event["ts"] = json!(0u64);
+        lines.push_str(&event.to_string());
+        lines.push('\n');
+    }
+    fs::write(&path, lines).unwrap();
+}
+
+/// Every parsable event of the project ledger (empty when no ledger exists).
+fn ledger_events(fixture: &LaunchFixture) -> Vec<Value> {
+    fs::read_to_string(project_ledger_path(fixture))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("ledger line parses as JSON"))
+        .collect()
+}
+
+/// Runs `hotpot status --workspace <repo>` with the clock pinned to `now`,
+/// asserting exit 0, and returns the parsed snapshot JSON.
+fn status_json(fixture: &LaunchFixture, now: u64) -> Value {
+    let out = fixture.run_with_env(
+        &[
+            "status",
+            "--workspace",
+            fixture.repo.to_str().unwrap(),
+        ],
+        &[("HOTPOT_NOW", &now.to_string())],
+    );
+    assert!(
+        out.status.success(),
+        "hotpot status must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    serde_json::from_slice(&out.stdout).expect("status prints one JSON snapshot")
+}
+
+/// The letter keys of a status snapshot's attention batch, in served order.
+fn attention_keys(snapshot: &Value) -> Vec<String> {
+    snapshot["attention"]
+        .as_array()
+        .map(|letters| {
+            letters
+                .iter()
+                .map(|l| l["key"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parses the fake `hc` send log into argv vectors (leading `send` word kept).
+fn recorded_sends(fixture: &LaunchFixture) -> Vec<Vec<String>> {
+    fs::read_to_string(fixture.hc_state.path().join("send.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            line.trim_start_matches(ARG_SEP)
+                .split(ARG_SEP)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// AC1 (noisy half): `hotpot attention feedback <att_id> noisy` records the
+/// `attention_feedback { action: mute }` event into the Project ledger from the
+/// CLI seam (no open MCP stdio session), and a subsequent `hotpot status` no
+/// longer lists that letter — muted keys stay silent past the rate window too.
+#[test]
+fn attention_feedback_noisy_mutes_the_letter_for_status() {
+    let fixture = LaunchFixture::new("att-noisy");
+    seed_project_ledger(
+        &fixture,
+        &[json!({"type": "permission_requested", "permission": "perm-1"})],
+    );
+
+    // Before the feedback, the stalled-permission letter is due in the batch.
+    let before = attention_keys(&status_json(&fixture, NOW));
+    assert!(
+        before.contains(&"att_stalled_permission_perm-1".to_string()),
+        "the stalled-permission letter is due before feedback: {before:?}"
+    );
+
+    let out = fixture.run_with_env(
+        &[
+            "attention",
+            "feedback",
+            "att_stalled_permission_perm-1",
+            "noisy",
+            "--workspace",
+            fixture.repo.to_str().unwrap(),
+        ],
+        &[("HOTPOT_NOW", &NOW.to_string())],
+    );
+    assert!(
+        out.status.success(),
+        "attention feedback noisy must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("att_stalled_permission_perm-1"),
+        "stdout names the rated letter: {}",
+        stdout_of(&out)
+    );
+
+    // Exactly one attention_feedback event lands in the ledger, mapped to the
+    // runtime's mute action.
+    let feedback: Vec<Value> = ledger_events(&fixture)
+        .into_iter()
+        .filter(|e| e["type"] == json!("attention_feedback"))
+        .collect();
+    assert_eq!(feedback.len(), 1, "one feedback event: {feedback:?}");
+    assert_eq!(feedback[0]["key"], json!("att_stalled_permission_perm-1"));
+    assert_eq!(feedback[0]["action"], json!("mute"));
+
+    // A later status batch no longer lists the letter — and a mute is durable
+    // past the rate window, unlike a snooze.
+    assert!(
+        !attention_keys(&status_json(&fixture, NOW))
+            .contains(&"att_stalled_permission_perm-1".to_string()),
+        "the muted letter is not served right after the feedback"
+    );
+    assert!(
+        !attention_keys(&status_json(&fixture, NOW + 700))
+            .contains(&"att_stalled_permission_perm-1".to_string()),
+        "a mute still silences the letter past the 600s rate window"
+    );
+}
+
+/// AC1 (useful half): `hotpot attention feedback <att_id> useful` records the
+/// snooze-form event; the letter is suppressed for the rate window and its
+/// re-emission respects that window — once the window elapses (and the
+/// condition still holds), the letter is served again.
+#[test]
+fn attention_feedback_useful_snoozes_for_the_rate_window() {
+    let fixture = LaunchFixture::new("att-useful");
+    seed_project_ledger(
+        &fixture,
+        &[json!({"type": "permission_requested", "permission": "perm-1"})],
+    );
+    assert!(
+        attention_keys(&status_json(&fixture, NOW))
+            .contains(&"att_stalled_permission_perm-1".to_string()),
+        "the letter is due before the feedback"
+    );
+
+    let out = fixture.run_with_env(
+        &[
+            "attention",
+            "feedback",
+            "att_stalled_permission_perm-1",
+            "useful",
+            "--workspace",
+            fixture.repo.to_str().unwrap(),
+        ],
+        &[("HOTPOT_NOW", &NOW.to_string())],
+    );
+    assert!(
+        out.status.success(),
+        "attention feedback useful must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+
+    let feedback: Vec<Value> = ledger_events(&fixture)
+        .into_iter()
+        .filter(|e| e["type"] == json!("attention_feedback"))
+        .collect();
+    assert_eq!(feedback.len(), 1, "one feedback event: {feedback:?}");
+    assert_eq!(feedback[0]["action"], json!("snooze"));
+
+    // Suppressed inside the window (the default rate window is 600s)...
+    assert!(
+        !attention_keys(&status_json(&fixture, NOW))
+            .contains(&"att_stalled_permission_perm-1".to_string()),
+        "the acknowledged letter is suppressed within the rate window"
+    );
+    // ...and re-emitted once the window has elapsed.
+    assert!(
+        attention_keys(&status_json(&fixture, NOW + 601))
+            .contains(&"att_stalled_permission_perm-1".to_string()),
+        "the letter re-emits after the rate window elapses"
+    );
+}
+
+/// AC2: an invalid action or a malformed letter id exits 2 with a usage line
+/// and writes nothing to the ledger; unknown `attention` forms fail closed.
+#[test]
+fn attention_feedback_rejects_invalid_forms_without_writing() {
+    let fixture = LaunchFixture::new("att-invalid");
+    seed_project_ledger(
+        &fixture,
+        &[json!({"type": "permission_requested", "permission": "perm-1"})],
+    );
+    let repo = fixture.repo.to_str().unwrap();
+    let invalid: Vec<Vec<&str>> = vec![
+        // Invalid action vocabulary.
+        vec!["attention", "feedback", "att_stalled_permission_perm-1", "maybe", "--workspace", repo],
+        // Malformed letter-key shapes.
+        vec!["attention", "feedback", "stalled_permission_perm-1", "noisy", "--workspace", repo],
+        vec!["attention", "feedback", "att_", "noisy", "--workspace", repo],
+        vec!["attention", "feedback", "att_has space", "noisy", "--workspace", repo],
+        // Missing / surplus positionals.
+        vec!["attention", "feedback", "att_x", "--workspace", repo],
+        vec!["attention", "feedback", "att_x", "noisy", "extra", "--workspace", repo],
+        // Unknown flag and unknown subcommand form.
+        vec!["attention", "feedback", "att_x", "noisy", "--rate", "5", "--workspace", repo],
+        vec!["attention", "rate", "att_x", "noisy"],
+        vec!["attention"],
+    ];
+    for args in &invalid {
+        let out = fixture.run(args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{args:?}` must exit 2 with a usage line (stderr: {})",
+            stderr_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("usage: hotpot attention feedback"),
+            "`{args:?}` prints the usage line: {}",
+            stderr_of(&out)
+        );
+    }
+    // None of the rejected forms touched the ledger.
+    assert_eq!(
+        ledger_events(&fixture)
+            .iter()
+            .filter(|e| e["type"] == json!("attention_feedback"))
+            .count(),
+        0,
+        "no feedback event is written by a rejected form"
+    );
+}
+
+/// AC3 (reuse half): `hotpot seat launch lead ... --prompt "do the thing"` reuses the
+/// Project's live Lead terminal, delivers the directive into it via `hc send`, and
+/// appends a ledger event carrying the directive that surfaces in the next
+/// `hotpot status` mailbox projection.
+#[test]
+fn seat_launch_prompt_delivers_directive_to_the_reused_lead() {
+    let fixture = LaunchFixture::new("prompt-reuse");
+    create_role_home(&fixture, "codex", "lead");
+    let slug = expected_slug(&fixture.repo);
+    script_terminal_list(&fixture, &[("term-lead-9", "live", "lead", &slug)]);
+
+    let out = fixture.launch("lead", "codex", &["--prompt", "do the thing"]);
+    assert!(
+        out.status.success(),
+        "lead launch with --prompt must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert_eq!(
+        fixture.create_invocations().len(),
+        0,
+        "the existing live lead is reused; no new terminal is created"
+    );
+
+    // The directive rides `hc send` to the reused terminal.
+    let sends = recorded_sends(&fixture);
+    assert_eq!(sends.len(), 1, "exactly one hc send: {sends:?}");
+    assert_eq!(
+        sends[0],
+        vec!["send".to_string(), "term-lead-9".to_string(), "do the thing".to_string()],
+        "hc send addresses the reused lead terminal with the directive text"
+    );
+
+    // The directive is durable in the project ledger (a Human directive to the seat).
+    let directives: Vec<Value> = ledger_events(&fixture)
+        .into_iter()
+        .filter(|e| e["type"] == json!("message_to_lead"))
+        .collect();
+    assert_eq!(directives.len(), 1, "one directive event: {directives:?}");
+    assert_eq!(directives[0]["message"], json!("do the thing"));
+    assert_eq!(directives[0]["from"], json!("human"));
+    assert_eq!(directives[0]["seat"], json!("codex-lead"));
+
+    // ...and it surfaces in the next status mailbox projection.
+    let snapshot = status_json(&fixture, NOW);
+    let entry = snapshot["mailbox"]
+        .as_array()
+        .unwrap_or_else(|| panic!("status serves a mailbox array: {snapshot}"))
+        .iter()
+        .find(|e| e["summary"] == json!("do the thing"))
+        .unwrap_or_else(|| panic!("the directive surfaces in the mailbox: {snapshot}"));
+    assert_eq!(entry["from"], json!("human"));
+    assert_eq!(entry["to"], json!("lead"));
+    assert_eq!(entry["kind"], json!("directive"));
+}
+
+/// AC3 (fresh-launch and peer halves): a `--prompt` on a fresh launch follows the same
+/// path — the directive rides `hc send` to the terminal resolved by the launch's
+/// canonical correlation labels, and the ledger event carries the directive with its
+/// target seat (the role for the single-seat roles, the assignment-scoped correlation
+/// for a Peer).
+#[test]
+fn seat_launch_prompt_follows_on_fresh_and_peer_launches() {
+    // Fresh Supervisor launch: the listing carries the terminal `hc run` created
+    // (a supervisor launch has no reuse guard, so the scripted entry never
+    // blocks it), addressed by its correlation label.
+    let fixture = LaunchFixture::new("prompt-fresh-sup");
+    create_role_home(&fixture, "codex", "supervisor");
+    let slug = expected_slug(&fixture.repo);
+    fs::write(
+        fixture.hc_state.path().join("list.json"),
+        json!([{
+            "address": "term-sup-1",
+            "status": "live",
+            "labels": {
+                "hotpot.v1": "true",
+                "hotpot.project": slug,
+                "hotpot.role": "supervisor",
+                "hotpot.agent": "codex",
+                "hotpot.correlation": "codex-supervisor",
+            },
+        }])
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let out = fixture.launch("supervisor", "codex", &["--prompt", "plan the migration"]);
+    assert!(
+        out.status.success(),
+        "supervisor launch with --prompt must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert_eq!(fixture.create_invocations().len(), 1, "a fresh terminal is created");
+    assert!(
+        stdout_of(&out).contains("delivered"),
+        "stdout reports the directive delivery: {}",
+        stdout_of(&out)
+    );
+    let sends = recorded_sends(&fixture);
+    assert_eq!(
+        sends,
+        vec![vec![
+            "send".to_string(),
+            "term-sup-1".to_string(),
+            "plan the migration".to_string()
+        ]],
+        "hc send addresses the terminal resolved by the correlation labels: {sends:?}"
+    );
+    let directives: Vec<Value> = ledger_events(&fixture)
+        .into_iter()
+        .filter(|e| e["type"] == json!("message_to_lead"))
+        .collect();
+    assert_eq!(directives.len(), 1, "one directive event: {directives:?}");
+    assert_eq!(directives[0]["to"], json!("supervisor"));
+    let snapshot = status_json(&fixture, NOW);
+    let entry = snapshot["mailbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["summary"] == json!("plan the migration"))
+        .expect("the directive surfaces in the mailbox");
+    assert_eq!(entry["to"], json!("supervisor"), "the mailbox names the target");
+
+    // Peer launch: same path, addressed by the assignment-scoped correlation.
+    let fixture = LaunchFixture::new("prompt-peer");
+    create_role_home(&fixture, "pi", "peer");
+    let slug = expected_slug(&fixture.repo);
+    fs::write(
+        fixture.hc_state.path().join("list.json"),
+        json!([{
+            "address": "term-peer-4",
+            "status": "live",
+            "labels": {
+                "hotpot.v1": "true",
+                "hotpot.project": slug,
+                "hotpot.role": "peer",
+                "hotpot.agent": "pi",
+                "hotpot.assignment": "asg-7",
+                "hotpot.parent": "term-lead-1",
+                "hotpot.correlation": "pi-peer-asg-7",
+            },
+        }])
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let out = fixture.launch(
+        "peer",
+        "pi",
+        &[
+            "--assignment",
+            "asg-7",
+            "--parent",
+            "term-lead-1",
+            "--prompt",
+            "review the gate output",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "peer launch with --prompt must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert_eq!(
+        recorded_sends(&fixture),
+        vec![vec![
+            "send".to_string(),
+            "term-peer-4".to_string(),
+            "review the gate output".to_string()
+        ]],
+        "hc send addresses the peer terminal by its correlation label"
+    );
+    let directives: Vec<Value> = ledger_events(&fixture)
+        .into_iter()
+        .filter(|e| e["type"] == json!("message_to_lead"))
+        .collect();
+    assert_eq!(directives.len(), 1, "one directive event: {directives:?}");
+    assert_eq!(directives[0]["to"], json!("pi-peer-asg-7"));
+    assert_eq!(directives[0]["seat"], json!("pi-peer-asg-7"));
+    let snapshot = status_json(&fixture, NOW);
+    let entry = snapshot["mailbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["summary"] == json!("review the gate output"))
+        .expect("the peer directive surfaces in the mailbox");
+    assert_eq!(entry["to"], json!("pi-peer-asg-7"));
+}
+
+/// Scope: an empty `--prompt` value (and a `--prompt` with no value at all) is a
+/// usage error — nothing is launched and nothing is recorded.
+#[test]
+fn seat_launch_empty_prompt_is_a_usage_error() {
+    let fixture = LaunchFixture::new("prompt-empty");
+    create_role_home(&fixture, "codex", "lead");
+    let repo = fixture.repo.to_str().unwrap();
+
+    let out = fixture.launch("lead", "codex", &["--prompt", ""]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an empty --prompt exits 2\nstderr: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stderr_of(&out).contains("usage: hotpot seat launch"),
+        "the usage line is printed: {}",
+        stderr_of(&out)
+    );
+
+    // A trailing `--prompt` with no value is the same usage error.
+    let out = fixture.run(&[
+        "seat", "launch", "lead", "--agent", "codex", "--project", repo, "--prompt",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a valueless --prompt exits 2\nstderr: {}",
+        stderr_of(&out)
+    );
+
+    assert_eq!(
+        fixture.create_invocations().len(),
+        0,
+        "no terminal is created by a rejected form"
+    );
+    assert!(
+        ledger_events(&fixture)
+            .iter()
+            .all(|e| e["type"] != json!("message_to_lead")),
+        "no directive is recorded by a rejected form"
+    );
+}
+
+/// Scope: when the seat's terminal cannot be resolved after a fresh launch (the
+/// `hc` listing carries no terminal with the launch's correlation labels), the
+/// launch still succeeds, the directive stays recorded in the ledger, and the
+/// failure is reported honestly on stderr.
+#[test]
+fn seat_launch_prompt_reports_honestly_when_no_terminal_resolves() {
+    let fixture = LaunchFixture::new("prompt-unresolved");
+    create_role_home(&fixture, "codex", "supervisor");
+    // The launch creates the terminal (recorded argv), but the listing never
+    // shows a terminal carrying this launch's correlation labels.
+    fs::write(fixture.hc_state.path().join("list.json"), "[]\n").unwrap();
+
+    let out = fixture.launch("supervisor", "codex", &["--prompt", "start the review"]);
+    assert!(
+        out.status.success(),
+        "the launch itself succeeds; delivery is best-effort\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert_eq!(fixture.create_invocations().len(), 1, "the terminal was created");
+    assert!(
+        recorded_sends(&fixture).is_empty(),
+        "no hc send happens without a resolved terminal"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("not delivered"),
+        "the failure is reported honestly on stderr: {stderr}"
+    );
+    assert_eq!(
+        ledger_events(&fixture)
+            .iter()
+            .filter(|e| e["type"] == json!("message_to_lead"))
+            .count(),
+        1,
+        "the directive stays durable in the ledger"
+    );
+}
+
+/// Scope: a failing `hc run` fails the launch, and the diagnostic quotes `hc`'s own stderr
+/// verbatim — capturing it via `.output()` must not also discard it (the operator sees what
+/// the real `herdr-core` actually said, not just the exit status).
+#[test]
+fn seat_launch_surfaces_hc_run_stderr_when_the_terminal_creation_fails() {
+    let fixture = LaunchFixture::new("run-failed");
+    create_role_home(&fixture, "codex", "supervisor");
+    write_failing_run_hc(fixture.bin.path(), "hc: control socket vanished mid-handshake");
+
+    let out = fixture.launch("supervisor", "codex", &[]);
+    assert!(
+        !out.status.success(),
+        "a failed hc run must fail the launch\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("[hc-run-failed]"),
+        "the diagnostic must carry the hc-run-failed code:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("hc: control socket vanished mid-handshake"),
+        "the diagnostic must quote hc's own stderr verbatim:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exited with"),
+        "the diagnostic keeps the exit status alongside the stderr text:\n{stderr}"
     );
 }

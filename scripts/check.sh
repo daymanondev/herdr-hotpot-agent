@@ -12,15 +12,18 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-echo "==> [1/7] Checking shared protocol.js sync across Herdr mods..."
+echo "==> [1/7] Checking shared module sync across Herdr mods..."
 ./scripts/sync.sh --check
 
 echo "==> [2/7] Checking JavaScript syntax in shared/ and mods/..."
 JS_FILES=(
   "shared/protocol.js"
+  "shared/chrome.js"
   "mods/hotpot/protocol.js"
+  "mods/hotpot/chrome.js"
   "mods/hotpot/main.js"
   "mods/hotpot-session/protocol.js"
+  "mods/hotpot-session/chrome.js"
   "mods/hotpot-session/main.js"
 )
 for js in "${JS_FILES[@]}"; do

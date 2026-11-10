@@ -95,6 +95,27 @@ fn base_plan_items() -> BTreeMap<String, &'static str> {
     items
 }
 
+/// The credential-seeding plan items expected over a fake operator home whose three
+/// credential sentinels exist (ticket 02): one independent credential copy plus one shape
+/// sidecar per seat — the operator home stays a read-only input.
+fn seeded_plan_items() -> BTreeMap<String, &'static str> {
+    let mut items = BTreeMap::new();
+    for agent in ["codex", "claude", "pi"] {
+        let credential = match agent {
+            "claude" => ".credentials.json",
+            _ => "auth.json",
+        };
+        for role in ["supervisor", "lead", "peer"] {
+            items.insert(format!("roles/{agent}/{role}/{credential}"), "file");
+            items.insert(
+                format!("roles/{agent}/{role}/credentials.preserved.json"),
+                "file",
+            );
+        }
+    }
+    items
+}
+
 /// Minimal PATH so the real operator environment (a possibly installed real `hc`) can never
 /// leak into these tests; the fake `hc` bin dir is prepended when the test wants one.
 fn sandbox_path(fake_bin: Option<&Path>) -> String {
@@ -112,6 +133,17 @@ fn write_fake_hc(bin_dir: &Path, log: &Path) {
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
         log.display()
     );
+    let shim = bin_dir.join("hc");
+    fs::write(&shim, script).unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Writes a fake `hc` shim whose every invocation fails: it prints `stderr_line` to stderr
+/// and exits `status` — the shape a real `herdr-core` reports for an unknown subcommand
+/// (`error: unrecognized subcommand 'profile'`, clap-style) or a genuine `hc` failure.
+fn write_failing_hc(bin_dir: &Path, stderr_line: &str, status: i32) {
+    fs::create_dir_all(bin_dir).unwrap();
+    let script = format!("#!/bin/sh\necho {stderr_line:?} >&2\nexit {status}\n");
     let shim = bin_dir.join("hc");
     fs::write(&shim, script).unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
@@ -210,8 +242,11 @@ fn setup_dry_run_prints_every_planned_path_and_mutates_nothing() {
         stderr_of(&out)
     );
     let stdout = stdout_of(&out);
-    for (rel, kind) in base_plan_items() {
-        let abs = home.path().join(&rel);
+    let mut expected_items = base_plan_items();
+    let seeding = seeded_plan_items();
+    expected_items.extend(seeding);
+    for (rel, kind) in &expected_items {
+        let abs = home.path().join(rel);
         assert!(
             stdout.contains(&format!("plan: {kind} {}", abs.display())),
             "dry-run stdout must print planned {kind} {rel}:\n{stdout}"
@@ -223,8 +258,9 @@ fn setup_dry_run_prints_every_planned_path_and_mutates_nothing() {
         .count();
     assert_eq!(
         plan_line_count,
-        base_plan_items().len(),
-        "dry-run must print exactly the base plan items, no more:\n{stdout}"
+        expected_items.len(),
+        "dry-run must print exactly the base plan items plus the credential seeding items \
+         the planted operator sentinels make eligible, no more:\n{stdout}"
     );
     assert!(
         stdout.to_lowercase().contains("dry-run"),
@@ -362,6 +398,74 @@ fn setup_apply_invokes_hc_with_the_planned_profile_change() {
         "apply must invoke hc with exactly the planned profile change"
     );
     assert!(home.path().join("hotpot.json").exists());
+}
+
+/// A real `herdr-core` (`hc`) lacking the `profile` subcommand must not fail `setup
+/// --apply`, but the dropped change may never be silent either: the report prints a skip
+/// note instead of an `applied:` line, and the rest of the plan still materializes.
+#[test]
+fn setup_apply_notes_the_skipped_profile_change_when_hc_lacks_the_subcommand() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let bin = TempDir::new("bin");
+    write_failing_hc(bin.path(), "error: unrecognized subcommand 'profile'", 2);
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        Some(bin.path()),
+        &["setup", "--apply"],
+    );
+    assert!(
+        out.status.success(),
+        "an hc without the profile subcommand must not fail setup --apply\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("skipped hc profile set hotpot hotpot.v1 true"),
+        "the dropped hc profile change must be reported as a skip note:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("applied: hc profile set"),
+        "a skipped change must not claim it was applied:\n{stdout}"
+    );
+    assert!(
+        home.path().join("hotpot.json").exists(),
+        "the rest of the plan still applies around the skipped hc step"
+    );
+}
+
+/// A genuine `hc` failure (any stderr but the unrecognized-subcommand form) must fail
+/// `setup --apply` carrying hc's own stderr text in the diagnostic — the exit status
+/// alone never hides what hc actually said.
+#[test]
+fn setup_apply_surfaces_hc_stderr_when_the_profile_change_fails() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let bin = TempDir::new("bin");
+    write_failing_hc(bin.path(), "hc: profile store is locked", 1);
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        Some(bin.path()),
+        &["setup", "--apply"],
+    );
+    assert!(
+        !out.status.success(),
+        "a failing hc profile set must fail setup --apply"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("[hc-profile-failed]"),
+        "the diagnostic must carry the hc-profile-failed code:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("hc: profile store is locked"),
+        "the diagnostic must quote hc's own stderr verbatim:\n{stderr}"
+    );
 }
 
 #[test]

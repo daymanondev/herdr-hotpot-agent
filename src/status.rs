@@ -11,7 +11,7 @@
 use crate::hc::HcTerminalSummary;
 use crate::runtime::{Ledger, RuntimeState, attention};
 use crate::slp::{
-    ContextSegments, HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus,
+    ContextSegments, HotpotStatusSnapshot, MailboxEntry, ProfileStatus, SeatStatus, TaskStatus,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -89,6 +89,13 @@ pub fn snapshot(
         project: slug.to_string(),
         workspace: workspace.to_string(),
         mode: "slp".to_string(),
+        // Hotpot Home is provisioned once `hotpot setup --apply` wrote its
+        // `hotpot.json` marker; the panel's Start action auto-provisions on it.
+        provisioned: home.join("hotpot.json").exists(),
+        has_workspace_protocol: Path::new(workspace)
+            .join("WORKSPACE_PROTOCOL.md")
+            .exists(),
+        profiles: resolved_profiles(&profiles),
         // The watch target handed to the mods' `watchFolder`; absent until any
         // runtime state exists, so a mod keeps its timer fallback instead of
         // subscribing to a directory that is not there.
@@ -101,6 +108,29 @@ pub fn snapshot(
         attention: attention_items,
         mailbox: project_mailbox(&events, &state),
     }
+}
+
+/// Each seat role's fully resolved default profile (ticket nui/01): the
+/// built-in role defaults with every `<HOTPOT_HOME>/profiles.json` field the
+/// role sets layered on top — a partial entry still resolves completely, and a
+/// role with no entry resolves to the built-ins alone. Only the three
+/// `PROFILE_ROLES` are served; unknown `profiles.json` keys stay private.
+fn resolved_profiles(recorded: &BTreeMap<String, RoleProfile>) -> BTreeMap<String, ProfileStatus> {
+    crate::profile::BUILTIN_ROLE_PROFILES
+        .iter()
+        .map(|builtin| {
+            let resolve = |recorded: Option<&String>, fallback: &str| {
+                recorded.cloned().unwrap_or_else(|| fallback.to_string())
+            };
+            let entry = recorded.get(builtin.role);
+            let status = ProfileStatus {
+                agent: resolve(entry.and_then(|p| p.agent.as_ref()), builtin.agent),
+                model: resolve(entry.and_then(|p| p.model.as_ref()), builtin.model),
+                thinking: resolve(entry.and_then(|p| p.thinking.as_ref()), builtin.thinking),
+            };
+            (builtin.role.to_string(), status)
+        })
+        .collect()
 }
 
 /// The segmented context of a seat: its latest `context_usage` event, matched by
@@ -388,7 +418,14 @@ fn project_mailbox(events: &[Value], state: &RuntimeState) -> Vec<MailboxEntry> 
                     .and_then(Value::as_str)
                     .unwrap_or("supervisor")
                     .to_string(),
-                to: "lead".to_string(),
+                // The Supervisor→Lead routing events carry no `to` (the Lead is
+                // the addressee by definition); the CLI `--prompt` directives of
+                // ticket nui/04 name their target seat explicitly.
+                to: event
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .unwrap_or("lead")
+                    .to_string(),
                 kind: "directive".to_string(),
                 summary: event
                     .get("message")
