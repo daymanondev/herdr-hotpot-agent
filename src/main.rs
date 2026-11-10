@@ -351,8 +351,10 @@ fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
 }
 
 /// `hotpot verify`: runs every Capability Hygiene check ([`hygiene::run_checks`]) over the
-/// Hotpot Home and the read-only operator inputs. Exits 0 with a per-check report on stdout
-/// when all closures hold; exits non-zero naming each failing check on stderr otherwise.
+/// Hotpot Home and the read-only operator inputs, then reports the per-seat authentication
+/// diagnostics ([`auth::diagnostics`]) as non-blocking, secret-free, offline lines. Exits 0
+/// with the report on stdout when all closures hold (diagnostics never affect the status);
+/// exits non-zero naming each failing check on stderr otherwise.
 fn cmd_verify() -> Result<(), PlanError> {
     let home = resolve_hotpot_home()?;
     let results = hygiene::run_checks(&home, hygiene::CheckMode::Verify);
@@ -364,6 +366,10 @@ fn cmd_verify() -> Result<(), PlanError> {
             eprintln!("{}", result.render());
             failed += 1;
         }
+    }
+    println!("verify: auth diagnostics (non-blocking, offline, secret-free)");
+    for diagnostic in auth::diagnostics(&home) {
+        println!("{}", diagnostic.render());
     }
     if failed == 0 {
         println!("verify: all checks passed ({} ok)", results.len());
