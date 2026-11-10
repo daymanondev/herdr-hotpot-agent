@@ -1,20 +1,19 @@
 pub mod guard;
 pub mod hc;
 pub mod inspector;
+pub mod runtime;
 pub mod slp;
 
 use guard::{Role, evaluate_pre_tool_hook};
 use inspector::{SessionInspection, TranscriptItem};
-use serde_json::{Value, json};
-use slp::{HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus, role_scoped_mcp_tools};
+use serde_json::Value;
+use slp::{HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus};
 use std::env;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 
 fn parse_flag(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == flag)
-        .map(|w| w[1].clone())
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
 fn project_slug_from_workspace(workspace: &str) -> String {
@@ -241,47 +240,33 @@ fn cmd_hook(args: &[String]) {
 fn cmd_mcp(args: &[String]) {
     let role_str = parse_flag(args, "--role")
         .or_else(|| env::var("HOTPOT_SEAT").ok())
-        .unwrap_or_else(|| "agent".to_string());
-    let role = Role::parse(&role_str).unwrap_or(Role::Agent);
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+        .unwrap_or_else(|| "peer".to_string());
+    let Some(role) = Role::parse(&role_str) else {
+        eprintln!("hotpot mcp: unknown role `{role_str}` (expected supervisor|lead|peer)");
+        std::process::exit(2);
+    };
+    let project = parse_flag(args, "--project")
+        .or_else(|| env::var("HOTPOT_PROJECT").ok())
+        .unwrap_or_else(|| ".".to_string());
+    let state_dir = parse_flag(args, "--state-dir")
+        .or_else(|| env::var("HOTPOT_HOME").ok())
+        .unwrap_or_else(default_hotpot_home);
+    // Accepted for the clean-room seat launch config; peer identity pinning via
+    // correlation lands with the peer identity slice.
+    let _correlation =
+        parse_flag(args, "--correlation").or_else(|| env::var("HOTPOT_CORRELATION").ok());
 
-    for line in stdin.lock().lines() {
-        let Ok(raw) = line else { break };
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let Ok(req) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-        let reply = match method {
-            "initialize" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "hotpot", "version": "0.1.0" }
-                }
-            }),
-            "tools/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "tools": role_scoped_mcp_tools(role)
-                }
-            }),
-            _ => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {}
-            }),
-        };
-        let _ = writeln!(stdout, "{reply}");
-        let _ = stdout.flush();
+    if let Err(e) = runtime::serve_mcp(role, Path::new(&project), Path::new(&state_dir)) {
+        eprintln!("hotpot mcp: {e}");
+        std::process::exit(1);
     }
+}
+
+/// Default `Hotpot Home` (`~/.hotpot`), overridable via `HOTPOT_HOME`.
+fn default_hotpot_home() -> String {
+    env::var("HOME")
+        .map(|h| format!("{h}/.hotpot"))
+        .unwrap_or_else(|_| ".hotpot".to_string())
 }
 
 fn main() {
