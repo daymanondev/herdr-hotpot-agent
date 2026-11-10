@@ -155,3 +155,92 @@ test("the panel wires all three dispatch surfaces through exec with busy states"
   );
   assert.deepEqual(missing, [], "every dispatch surface is wired");
 });
+
+// ---------------------------------------------------------------------------
+// Ticket 08: the Session Inspector's native redesign at the source-hygiene and
+// wiring boundary — zero emoji characters and no "█" block bars across the
+// inspector mod and both synced protocol.js copies (the shared file is the
+// single source of truth, so an emoji anywhere in it surfaces in both), the
+// forbidden-API scan over the pure protocol copies, and the native pieces the
+// redesign names (vendor icons through Herdr's registry, native chevrons, the
+// compact 28px tool-call row, the 3px context bar, the Terminal action).
+// ---------------------------------------------------------------------------
+
+const INSPECTOR_NATIVE_SOURCES = [
+  "../../mods/hotpot-session/main.js",
+  "../../mods/hotpot/protocol.js",
+  "../../mods/hotpot-session/protocol.js",
+];
+
+function sourceHygieneOffenders(source) {
+  const offenders = [];
+  if (EMOJI.test(source)) offenders.push("an emoji character");
+  if (BLOCK_BAR.test(source)) offenders.push('the "█" block character');
+  return offenders;
+}
+
+// Known-bad fixtures the scan must flag over every covered source: the old
+// inspector header eye, the old kind-icon emojis, the old expand/collapse
+// glyphs, the keyboard prefix, and the ASCII block bar.
+const HYGIENE_FIXTURES = [
+  ['div().child(`👁 ${title}`)', "the old eye-prefixed header title"],
+  ['return { icon: "💭", label: "Thinking" }', "an emoji kind icon"],
+  ['child(isCollapsed ? "▶ Expand" : "▼ Collapse")', "the old text expand/collapse glyphs"],
+  ['child("⌨ Raw PTY · Alt+T")', "the old keyboard-prefixed button"],
+  ['"█".repeat(cells)', "a block-glyph bar"],
+];
+
+test("the inspector hygiene scan bites on every covered source (self-check on known-bad fixtures)", () => {
+  for (const rel of INSPECTOR_NATIVE_SOURCES) {
+    for (const [fixture, label] of HYGIENE_FIXTURES) {
+      assert.ok(
+        sourceHygieneOffenders(fixture).length > 0,
+        `${rel}: the scan flags ${label}`,
+      );
+    }
+  }
+});
+
+test("the session inspector and both synced protocol copies carry no emoji and no block bars", () => {
+  for (const rel of INSPECTOR_NATIVE_SOURCES) {
+    const source = readFileSync(new URL(rel, import.meta.url), "utf8");
+    assert.deepEqual(sourceHygieneOffenders(source), [], rel);
+  }
+});
+
+test("the synced protocol copies use no browser or Node timer globals", () => {
+  for (const rel of ["../../mods/hotpot/protocol.js", "../../mods/hotpot-session/protocol.js"]) {
+    const source = readFileSync(new URL(rel, import.meta.url), "utf8");
+    const offenders = source
+      .split("\n")
+      .map((line, i) => [i + 1, line])
+      .filter(([, line]) => FORBIDDEN.test(line));
+    assert.deepEqual(
+      offenders.map(([line]) => line),
+      [],
+      `${rel} stays a pure module with no DOM or timer globals`,
+    );
+  }
+});
+
+const INSPECTOR_NATIVE_REQUIRED = [
+  ["knownAgents(", "Herdr's agent registry for the header vendor icon"],
+  ["agentIconModel(", "the 06 icon-descriptor rule"],
+  ["inspectorHeaderModel(", "the native header model (which owns the context bar)"],
+  ["terminalAction", "the Terminal action model"],
+  ["toolCallCollapsedModel(", "the tool-call collapse model"],
+  ["defaultItemExpanded(", "the thinking expand-on-active default"],
+  ["chevron-down.svg", "the expanded-row native chevron"],
+  ["chevron-right.svg", "the collapsed-row native chevron"],
+  [".h(28)", "the compact one-line tool-call row"],
+  [".h(3)", "the 3px context-bar track"],
+  ["terminal.svg", "the terminal glyph (fallback icon and button)"],
+];
+
+test("the session inspector renders the native redesign pieces the ticket names", () => {
+  const source = readFileSync(new URL("../../mods/hotpot-session/main.js", import.meta.url), "utf8");
+  const missing = INSPECTOR_NATIVE_REQUIRED.filter(([needle]) => !source.includes(needle)).map(
+    ([, label]) => label,
+  );
+  assert.deepEqual(missing, [], "every native redesign piece is rendered");
+});

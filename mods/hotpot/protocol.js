@@ -285,27 +285,37 @@ const NOTICE_KINDS = new Set([
   "mailbox",
 ]);
 
-/** The icon + label one transcript item kind renders with: 💬 messages, 💭
- * Thinking, 🔧 Tool Calls, and 📩 notices. Unknown kinds still get a label so
- * the inspector never renders an unlabeled block. */
+/** The icon + label one transcript item kind renders with (ticket nui/08: an
+ * icon descriptor, never an emoji character): `thinking` rows carry the
+ * layered chrome glyph, `tool_call` rows the terminal chrome glyph, `message`
+ * rows the vendor-icon marker (the mod resolves it through `agentIconModel`
+ * against Herdr's program table), and notices carry no icon — the accent
+ * notice card is its own chrome. Unknown kinds still get a label so the
+ * inspector never renders an unlabeled block. */
 export function transcriptKindMeta(kind) {
   if (kind === "thinking") {
-    return { icon: "💭", label: "Thinking" };
+    return {
+      icon: { kind: "chrome", icon: "mods/workspace-chrome/layers.svg", tint: true },
+      label: "Thinking",
+    };
   }
   if (kind === "tool_call") {
-    return { icon: "🔧", label: "Tool Call" };
+    return {
+      icon: { kind: "chrome", icon: "mods/workspace-chrome/terminal.svg", tint: true },
+      label: "Tool Call",
+    };
   }
   if (NOTICE_KINDS.has(kind)) {
-    return { icon: "📩", label: "Notice" };
+    return { icon: null, label: "Notice" };
   }
   if (kind === "message") {
-    return { icon: "💬", label: "Message" };
+    return { icon: { kind: "vendor" }, label: "Message" };
   }
-  return { icon: "•", label: kind || "Item" };
+  return { icon: null, label: kind || "Item" };
 }
 
-/** Whether an inspect item kind is a 📩 notice (attention or assignment
- * notices, and the legacy `mailbox` kind). */
+/** Whether an inspect item kind is a notice (attention or assignment notices,
+ * and the legacy `mailbox` kind). */
 export function isNoticeKind(kind) {
   return NOTICE_KINDS.has(kind);
 }
@@ -326,10 +336,11 @@ export function isSeatActive(seatOrStatus) {
   return SEAT_ACTIVE_STATUSES.has(String(status).trim().toLowerCase());
 }
 
-/** Default expansion of one inspect item: 💭 Thinking blocks render expanded
+/** Default expansion of one inspect item: Thinking blocks render expanded
  * while the seat's turn is active (the Human watches the reasoning stream)
- * and collapsed once the seat goes idle or finishes; every other kind always
- * renders in full. */
+ * and collapsed once the seat goes idle or finishes; every other kind renders
+ * in full — except `tool_call` rows, whose compact collapsed default is owned
+ * by `toolCallCollapsedModel` (ticket nui/08). */
 export function defaultItemExpanded(item, seatActive) {
   if (item && item.kind === "thinking") {
     return Boolean(seatActive);
@@ -343,6 +354,62 @@ export function defaultItemExpanded(item, seatActive) {
 export function ptyTarget(seat) {
   const address = typeof seat === "object" && seat !== null ? seat.terminal : null;
   return typeof address === "string" && address.trim() !== "" ? address : null;
+}
+
+// ---------------------------------------------------------------------------
+// Session Inspector native redesign (ticket nui/08)
+// ---------------------------------------------------------------------------
+
+/** The collapse model of one `tool_call` transcript row (ticket nui/08): the
+ * compact 28px row is the default state — collapsed regardless of seat
+ * activity, unlike Thinking — and `toggle()` yields the override the next
+ * click pins (the boolean opposite of the row's current state, so toggling
+ * twice lands back on the collapsed default). Non-tool-call items report
+ * `applies: false` and no state: this model never touches Thinking rows,
+ * whose expand-on-active defaults stay `defaultItemExpanded`'s to own. Pure
+ * over the item, the seat's activity, and the caller's pinned override
+ * (`null`/`undefined` follows the default). */
+export function toolCallCollapsedModel(item, seatActive, override = null) {
+  const applies = item?.kind === "tool_call";
+  // Seat activity (`seatActive`) never opens a tool-call row: the compact row
+  // is the default whether the turn is streaming or long finished.
+  const defaultCollapsed = true;
+  const hasOverride = override === true || override === false;
+  const collapsed = hasOverride ? override : defaultCollapsed;
+  return {
+    kind: "tool_call",
+    applies,
+    defaultCollapsed,
+    collapsed: applies ? collapsed : null,
+    toggle: () => !collapsed,
+  };
+}
+
+/** The native Session Inspector header's model over the selected seat and the
+ * live inspection backing it (ticket nui/08): the seat's vendor icon through
+ * the 06 descriptor rule (`agentIconModel` over Herdr's program table, the
+ * terminal glyph as fallback), the title/role/model badges, the geometric
+ * context bar (`contextBarModel`, preferring the inspection's live parsed
+ * usage over the seat entry's last-known context), and the `Terminal · Alt+T`
+ * action — enabled through `ptyTarget` when the seat has a live `hc`
+ * terminal, disabled with a hint when it does not. Pure and total over any
+ * seat shape. */
+export function inspectorHeaderModel(seat, registry, inspection = null) {
+  const agent = seat?.agent ?? seat?.provider ?? null;
+  const context = inspection?.context ?? seat?.context ?? null;
+  return {
+    title: seat?.title ?? null,
+    role: seat?.role ?? null,
+    agent,
+    model: seat?.model ?? null,
+    icon: agentIconModel(agent, registry),
+    context: contextBarModel(context),
+    terminalAction: {
+      label: "Terminal · Alt+T",
+      enabled: ptyTarget(seat) !== null,
+      hint: ptyTarget(seat) === null ? "no live hc terminal" : null,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
