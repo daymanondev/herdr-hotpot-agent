@@ -1,0 +1,24 @@
+{
+  "layout:hotpot": {
+    "ctrl-shift-h": {
+      "command": "layout.toggle",
+      "args": {
+        "id": "hotpot"
+      }
+    },
+    "ctrl-shift-i": {
+      "command": "layout.select",
+      "args": {
+        "stack": "main-stack",
+        "child": "inspector"
+      }
+    },
+    "ctrl-shift-m": {
+      "command": "layout.select",
+      "args": {
+        "stack": "main-stack",
+        "child": "main"
+      }
+    }
+  }
+}

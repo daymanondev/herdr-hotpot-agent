@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Local scratch issue tracker (Matt Pocock engineering skills) — not published
+.scratch/
+
+# Private research notes
+research/
+
+# macOS
+.DS_Store
+
+# Herdr live type definitions copied locally for IDE completion
+types/gpui-kit.d.ts
+types/herdr.d.ts
+
+# Scratch install / demo environments
+.tmp/
+herdr-shot.png
