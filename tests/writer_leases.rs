@@ -579,3 +579,40 @@ fn lease_reclaim_force_frees_a_stale_lease_with_an_audit_event() {
         "reclaim without a lease names the missing lease: {message}"
     );
 }
+
+#[test]
+fn any_held_lease_refuses_lead_originated_checkout_dispatch() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+
+    // A worktree writer holds a lease; even the dispatching Lead's own next
+    // writable checkout dispatch is refused with writer_exclusive.
+    let isolated = create_assignment(&mut mcp, worktree_create(&head, &["src/engine/**"], &[]));
+    let dispatched = dispatch_worktree(&mut mcp, &isolated);
+    assert!(dispatched.get("error").is_none(), "{dispatched}");
+
+    let checkout_writer = create_assignment(&mut mcp, valid_create(&head));
+    let refused = mcp.tools_call(
+        json!(3),
+        "assignment_dispatch",
+        json!({"assignment": checkout_writer}),
+    );
+    let message = error_message(&refused);
+    assert!(
+        message.contains("writer_exclusive"),
+        "writer_exclusive applies to all seats while any lease is held: {message}"
+    );
+    assert!(
+        message.contains(&isolated),
+        "refusal names the held worktree lease: {message}"
+    );
+
+    // The isolated pool is unaffected: another disjoint worktree peer still works.
+    let peer = create_assignment(&mut mcp, worktree_create(&head, &["docs/**"], &[]));
+    let peer_dispatch = dispatch_worktree(&mut mcp, &peer);
+    assert!(
+        peer_dispatch.get("error").is_none(),
+        "isolated writers keep dispatching under a held lease: {peer_dispatch}"
+    );
+}

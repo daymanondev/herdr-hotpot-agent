@@ -4,10 +4,11 @@
 //! This slice delivers the exact per-role tool surface, the Lead `Assignment`
 //! lifecycle (`Draft -> Dispatched -> Asking | HandedBack | Stopped`; terminal
 //! states -> `Closed`), verified `baseCommit`, the `thinking` effort refusal, and
-//! Writer Leases for writable assignments (exclusive in-checkout after clean-HEAD
-//! verification; isolated worktrees land with the worktree slice). Peer
-//! `ask`/`handoff` semantics, detached gate execution, and supervisor tool
-//! semantics land with their own runtime slices.
+//! Writer Leases for writable assignments: the exclusive in-checkout lease after
+//! clean-HEAD verification, plus up to three scope-disjoint isolated worktrees
+//! provisioned with a warm build cache (see [`leases`]). Peer `ask`/`handoff`
+//! semantics, detached gate execution, and supervisor tool semantics land with
+//! their own runtime slices.
 
 pub mod ledger;
 pub mod leases;
