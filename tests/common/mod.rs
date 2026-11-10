@@ -256,6 +256,10 @@ pub fn ledger_line_count(home: &Path) -> usize {
 
 /// Appends an event line to the ledger the way a later runtime slice (peer `ask` /
 /// `handoff`, ticket 09) will write it: `seq` continues the strictly increasing count.
+/// Like the engine's `Ledger::append`, the line and its newline go out in one
+/// `write` — the engine or the detached gate runner may be appending to the
+/// same file while the test reads it, and `writeln!`'s separate newline write
+/// is readable as a torn line in between.
 pub fn seed_ledger_event(home: &Path, mut event: Value) {
     let path = ledger_path(home);
     let next = ledger_lines(home)
@@ -266,8 +270,7 @@ pub fn seed_ledger_event(home: &Path, mut event: Value) {
         + 1;
     event["seq"] = json!(next);
     event["ts"] = json!(0);
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-    writeln!(file, "{event}").unwrap();
+    append_line(&path, &event.to_string());
 }
 
 /// The canonical `<basename>-<sha1(gitRoot)[0..6]>` slug of `repo`, computed through
@@ -318,12 +321,22 @@ pub fn seed_ledger_event_at(home: &Path, repo: &Path, mut event: Value, ts: u64)
         + 1;
     event["seq"] = json!(next);
     event["ts"] = json!(ts);
+    append_line(&path, &event.to_string());
+}
+
+/// Appends `line` plus its newline in one write on an append-mode file — the
+/// same single-write discipline as the engine's `Ledger::append`.
+fn append_line(path: &Path, line: &str) {
+    use std::io::Write;
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .unwrap();
-    writeln!(file, "{event}").unwrap();
+    file.write_all(buf.as_bytes()).unwrap();
 }
 
 /// Valid story-19 `assignment_create` arguments against the given verified commit.

@@ -211,17 +211,26 @@ impl Ledger {
     /// Appends one event with the next strictly increasing `seq` and a unix `ts`
     /// stamped by the runtime clock ([`now_secs`]). The file is opened in append
     /// mode only — the ledger never shrinks.
+    ///
+    /// The rendered line plus its newline land in ONE `write` on the append-mode
+    /// file: `writeln!` issues separate writes for the body and the newline, and
+    /// a concurrent reader (`hotpot status`, another seat's evidence recorder,
+    /// the detached gate runner appending its `gate_completed` event) could
+    /// observe the half-written line between them. A single write makes each
+    /// event all-or-nothing for every reader and keeps two appenders from
+    /// interleaving fragments of their lines.
     pub fn append(&self, mut event: Value) -> Result<u64, LedgerError> {
         let next = self.next_seq();
         let ts = now_secs();
         event["seq"] = json!(next);
         event["ts"] = json!(ts);
+        let mut line = event.to_string();
+        line.push('\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        writeln!(file, "{event}")?;
-        file.flush()?;
+        file.write_all(line.as_bytes())?;
         Ok(next)
     }
 
