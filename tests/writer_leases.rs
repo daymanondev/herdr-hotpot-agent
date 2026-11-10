@@ -449,3 +449,79 @@ fn worktree_peers_share_cargo_target_dir_and_worktreeinclude_symlinks() {
         "worktree peers share one CARGO_TARGET_DIR"
     );
 }
+
+#[test]
+fn workspace_close_cleans_in_flight_worktrees_and_retains_handed_back_candidates() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+
+    // In-flight worktree: closing the workspace removes it from disk.
+    let in_flight = create_assignment(&mut mcp, worktree_create(&head, &["src/engine/**"], &[]));
+    let dispatched = dispatch_worktree(&mut mcp, &in_flight);
+    let worktree = dispatched["result"]["lease"]["worktree"].as_str().unwrap().to_string();
+    let closed = mcp.tools_call(
+        json!(3),
+        "workspace_close",
+        json!({"assignment": in_flight}),
+    );
+    assert!(closed.get("error").is_none(), "{closed}");
+    assert_eq!(closed["result"]["lease"]["worktreeAction"], "removed");
+    assert!(
+        !std::path::Path::new(&worktree).exists(),
+        "in-flight worktree is cleaned from disk"
+    );
+    let released = ledger_events_of_type(home.path(), "writer_lease_released");
+    assert_eq!(released.last().unwrap()["worktreeAction"], "removed");
+
+    // Handed-back candidate: the worktree is retained as integration evidence.
+    let candidate = create_assignment(&mut mcp, worktree_create(&head, &["src/ui/**"], &[]));
+    let dispatched = dispatch_worktree(&mut mcp, &candidate);
+    let candidate_worktree = dispatched["result"]["lease"]["worktree"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    common::seed_ledger_event(
+        home.path(),
+        json!({
+            "type": "assignment_handed_back",
+            "assignment": candidate,
+            "summary": "peer handback awaiting manual integration"
+        }),
+    );
+    let closed = mcp.tools_call(
+        json!(5),
+        "workspace_close",
+        json!({"assignment": candidate}),
+    );
+    assert!(closed.get("error").is_none(), "{closed}");
+    assert_eq!(closed["result"]["lease"]["worktreeAction"], "retained");
+    assert!(
+        std::path::Path::new(&candidate_worktree).exists(),
+        "a handed-back candidate worktree is retained on disk"
+    );
+
+    // Both leases are freed: a fresh exclusive dispatch succeeds.
+    let writable = create_assignment(&mut mcp, valid_create(&head));
+    let exclusive = mcp.tools_call(
+        json!(6),
+        "assignment_dispatch",
+        json!({"assignment": writable}),
+    );
+    assert!(
+        exclusive.get("error").is_none(),
+        "released leases free the checkout for a new writer: {exclusive}"
+    );
+
+    // Closing again is refused: the lease is already released.
+    let again = mcp.tools_call(
+        json!(7),
+        "workspace_close",
+        json!({"assignment": in_flight}),
+    );
+    let message = error_message(&again);
+    assert!(
+        message.contains("no active writer lease"),
+        "double close names the missing lease: {message}"
+    );
+}

@@ -875,27 +875,47 @@ fn assignment_dispatch(
 }
 
 /// `workspace_close`: release the assignment's Writer Lease and clean/retain its
-/// isolated worktree per assignment state (spec user story 20-22).
+/// isolated worktree per assignment state — a handed-back candidate (evidence
+/// awaiting manual integration) is retained, anything else is cleaned up.
 fn workspace_close(
     ledger: &Ledger,
     project_root: &Path,
     args: &Value,
 ) -> Result<Value, RpcError> {
     const TOOL: &str = "workspace_close";
-    let _ = project_root; // worktree clean/retain lands with the isolated worktree slice
     let id = arg_str(args, TOOL, "assignment")?;
-    require_assignment(ledger, TOOL, &id)?;
-    if RuntimeState::load(ledger).lease_for(&id).is_none() {
-        return Err(RpcError::invalid_params(format!(
-            "{TOOL}: no active writer lease for `{id}`; workspace_close releases a lease held by a dispatched assignment"
-        )));
-    }
+    let state = RuntimeState::load(ledger);
+    let lease = state
+        .lease_for(&id)
+        .ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "{TOOL}: no active writer lease for `{id}`; workspace_close releases a lease held by a dispatched assignment"
+            ))
+        })?
+        .clone();
+    let asg = state
+        .assignment(&id)
+        .expect("a lease only exists for a recorded assignment")
+        .clone();
+
+    let action = if lease.mode == leases::ISOLATED_WORKTREE
+        && let Some(worktree) = &lease.worktree
+    {
+        if ["HandedBack", "GateRunning"].contains(&asg.state.as_str()) {
+            "retained"
+        } else {
+            leases::remove_worktree(project_root, Path::new(worktree))?;
+            "removed"
+        }
+    } else {
+        "none"
+    };
 
     ledger
         .append(json!({
             "type": "writer_lease_released",
             "assignment": id,
-            "worktreeAction": "none",
+            "worktreeAction": action,
         }))
         .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
     let state = RuntimeState::load(ledger);
@@ -903,7 +923,7 @@ fn workspace_close(
         .assignment(&id)
         .expect("assignment exists before its lifecycle event")
         .to_json();
-    result["lease"] = json!({"released": true, "worktreeAction": "none"});
+    result["lease"] = json!({"released": true, "worktreeAction": action});
     Ok(result)
 }
 
