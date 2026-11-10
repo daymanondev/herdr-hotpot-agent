@@ -242,12 +242,25 @@ fn cmd_hook(args: &[String]) {
     let state_dir = parse_flag(args, "--state-dir")
         .or_else(|| env::var("HOTPOT_STATE_DIR").ok())
         .unwrap_or_default();
+    let correlation = parse_flag(args, "--correlation")
+        .or_else(|| env::var("HOTPOT_CORRELATION").ok());
 
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
     let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
     let response = evaluate_pre_tool_hook(role, &payload, &workspace, &state_dir, None);
     println!("{}", response);
+
+    // Runtime evidence capture: allowed tool calls of a correlated peer seat are
+    // recorded as minimal ledger events for its workspace, so a later `handoff`
+    // can check that the Gate ran after the peer's last write (ticket 09).
+    if let Some(correlation) = correlation.as_deref().filter(|c| !c.is_empty())
+        && role == Role::Agent
+        && !state_dir.is_empty()
+    {
+        let allowed = response["hookSpecificOutput"]["permissionDecision"] == "allow";
+        runtime::evidence::record_hook_event(Path::new(&state_dir), correlation, &payload, allowed);
+    }
 }
 
 fn cmd_mcp(args: &[String]) {
@@ -264,12 +277,17 @@ fn cmd_mcp(args: &[String]) {
     let state_dir = parse_flag(args, "--state-dir")
         .or_else(|| env::var("HOTPOT_HOME").ok())
         .unwrap_or_else(default_hotpot_home);
-    // Accepted for the clean-room seat launch config; peer identity pinning via
-    // correlation lands with the peer identity slice.
-    let _correlation =
+    // The server-side session identity pin a peer seat derives its assignment
+    // binding from; never taken from tool arguments.
+    let correlation =
         parse_flag(args, "--correlation").or_else(|| env::var("HOTPOT_CORRELATION").ok());
 
-    if let Err(e) = runtime::serve_mcp(role, Path::new(&project), Path::new(&state_dir)) {
+    if let Err(e) = runtime::serve_mcp(
+        role,
+        Path::new(&project),
+        Path::new(&state_dir),
+        correlation.as_deref(),
+    ) {
         eprintln!("hotpot mcp: {e}");
         std::process::exit(1);
     }

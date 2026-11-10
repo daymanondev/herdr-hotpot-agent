@@ -102,11 +102,26 @@ pub struct McpProcess {
 
 impl McpProcess {
     pub fn spawn(role: &str, project: &Path, home: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_hotpot"))
-            .args(["mcp", "--role", role])
+        Self::spawn_correlated(role, project, home, None)
+    }
+
+    /// Spawns `hotpot mcp` with the session correlation pin (`--correlation`),
+    /// the server-side identity a peer seat derives its binding from.
+    pub fn spawn_correlated(
+        role: &str,
+        project: &Path,
+        home: &Path,
+        correlation: Option<&str>,
+    ) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hotpot"));
+        cmd.args(["mcp", "--role", role])
             .arg("--project")
             .arg(project)
-            .env("HOTPOT_HOME", home)
+            .env("HOTPOT_HOME", home);
+        if let Some(correlation) = correlation {
+            cmd.arg("--correlation").arg(correlation);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -262,4 +277,58 @@ pub fn create_assignment(mcp: &mut McpProcess, args: Value) -> String {
         "assignment_create must succeed: {resp}"
     );
     resp["result"]["id"].as_str().unwrap().to_string()
+}
+
+/// Invokes `hotpot hook` for a correlated peer seat with a PreToolUse payload and
+/// returns the parsed verdict, asserting the process exited 0.
+pub fn peer_hook(home: &Path, correlation: &str, payload: &Value) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hotpot"))
+        .args(["hook", "--role", "peer", "--correlation", correlation])
+        .arg("--state-dir")
+        .arg(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hotpot hook");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{payload}").unwrap();
+        stdin.flush().unwrap();
+    }
+    // Closing stdin lets the hook's read_to_string finish.
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("hotpot hook exits");
+    assert!(
+        out.status.success(),
+        "hotpot hook exited {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
+}
+
+/// A PreToolUse payload for a file-write tool touching `path` inside a workspace.
+pub fn write_payload(path: &Path) -> Value {
+    json!({
+        "tool_name": "Write",
+        "tool_input": {"file_path": path, "content": "fixture\n"}
+    })
+}
+
+/// A PreToolUse payload for a Bash tool running `command`.
+pub fn bash_payload(command: &str) -> Value {
+    json!({"tool_name": "Bash", "tool_input": {"command": command}})
+}
+
+/// Commits `rel` with `content` inside `repo` and returns the new HEAD sha.
+pub fn commit_file(repo: &Path, rel: &str, content: &str) -> String {
+    let file = repo.join(rel);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&file, content).unwrap();
+    git(repo, &["add", "--", rel]);
+    git(repo, &["commit", "-qm", &format!("fixture: touch {rel}")]);
+    git(repo, &["rev-parse", "HEAD"])
 }

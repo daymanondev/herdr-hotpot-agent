@@ -6,10 +6,14 @@
 //! states -> `Closed`), verified `baseCommit`, the `thinking` effort refusal, and
 //! Writer Leases for writable assignments: the exclusive in-checkout lease after
 //! clean-HEAD verification, plus up to three scope-disjoint isolated worktrees
-//! provisioned with a warm build cache (see [`leases`]). Peer `ask`/`handoff`
-//! semantics, detached gate execution, and supervisor tool semantics land with
-//! their own runtime slices.
+//! provisioned with a warm build cache (see [`leases`]). The Peer surface is
+//! strictly `ask`/`handoff` with identity, assignment, and workspace derived
+//! server-side from the session correlation (never from tool arguments), and
+//! every writable `handoff` validated against live Git `baseCommit..Candidate`
+//! evidence (see [`evidence`]). Detached gate execution and supervisor tool
+//! semantics land with their own runtime slices.
 
+pub mod evidence;
 pub mod ledger;
 pub mod leases;
 
@@ -135,11 +139,11 @@ pub fn role_tool_defs(role: Role) -> Vec<Value> {
         Role::Agent => &[
             (
                 "ask",
-                "Ask the Lead a question about the current Assignment.",
+                "Raise a question or a structured Challenge Signal (REOPEN_REQUEST, DEPENDENCY_REQUEST, BLOCKED) to the Lead for the current Assignment; identity, assignment, and workspace are derived server-side from the session correlation.",
             ),
             (
                 "handoff",
-                "Submit finished work for the current Assignment with verified evidence.",
+                "Submit finished work for the current Assignment, validated against live Git baseCommit..Candidate evidence; identity, assignment, and workspace are derived server-side from the session correlation.",
             ),
         ],
     };
@@ -187,7 +191,14 @@ fn rpc_error_response(id: Value, code: i32, message: &str) -> Value {
 }
 
 /// Runs the stdio JSON-RPC 2.0 server loop: one response line per request line.
-pub fn serve_mcp(role: Role, project_root: &Path, state_dir: &Path) -> Result<(), String> {
+/// `correlation` is the server-side session identity pin a Peer seat derives its
+/// assignment binding from (`--correlation` / `HOTPOT_CORRELATION` at launch).
+pub fn serve_mcp(
+    role: Role,
+    project_root: &Path,
+    state_dir: &Path,
+    correlation: Option<&str>,
+) -> Result<(), String> {
     let ledger = Ledger::open(state_dir, project_root).map_err(|e| e.to_string())?;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -196,7 +207,7 @@ pub fn serve_mcp(role: Role, project_root: &Path, state_dir: &Path) -> Result<()
         if raw.trim().is_empty() {
             continue;
         }
-        if let Some(reply) = handle_line(&ledger, role, project_root, &raw) {
+        if let Some(reply) = handle_line(&ledger, role, project_root, correlation, &raw) {
             let _ = writeln!(stdout, "{reply}");
             let _ = stdout.flush();
         }
@@ -205,7 +216,13 @@ pub fn serve_mcp(role: Role, project_root: &Path, state_dir: &Path) -> Result<()
 }
 
 /// Handles one raw request line; returns `None` for JSON-RPC notifications (no `id`).
-fn handle_line(ledger: &Ledger, role: Role, project_root: &Path, raw: &str) -> Option<Value> {
+fn handle_line(
+    ledger: &Ledger,
+    role: Role,
+    project_root: &Path,
+    correlation: Option<&str>,
+    raw: &str,
+) -> Option<Value> {
     let req: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
@@ -254,7 +271,7 @@ fn handle_line(ledger: &Ledger, role: Role, project_root: &Path, raw: &str) -> O
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match call_tool(ledger, project_root, name, &arguments) {
+            match call_tool(ledger, project_root, correlation, name, &arguments) {
                 Ok(result) => Some(rpc_response(id, result)),
                 Err(e) => Some(rpc_error_response(id, e.code, &e.message)),
             }
@@ -276,6 +293,7 @@ fn handle_line(ledger: &Ledger, role: Role, project_root: &Path, raw: &str) -> O
 fn call_tool(
     ledger: &Ledger,
     project_root: &Path,
+    correlation: Option<&str>,
     tool: &str,
     args: &Value,
 ) -> Result<Value, RpcError> {
@@ -289,9 +307,8 @@ fn call_tool(
         "gate_run" => gate_run(ledger, args),
         "workspace_close" => workspace_close(ledger, project_root, args),
         "lease_reclaim" => lease_reclaim(ledger, args),
-        "ask" | "handoff" => Err(RpcError::not_implemented(format!(
-            "`{tool}` semantics land with the peer identity slice; the correlation -> assignment binding is registered at assignment_dispatch"
-        ))),
+        "ask" => peer_ask(ledger, correlation, args),
+        "handoff" => peer_handoff(ledger, correlation, args),
         _ => Err(RpcError::not_implemented(format!(
             "`{tool}` semantics land with the assignment lifecycle slice"
         ))),
@@ -339,6 +356,13 @@ pub struct Assignment {
     pub thinking_reason: Option<String>,
     pub correlation: Option<String>,
     pub workspace: Option<String>,
+    /// The Lead's latest `assignment_answered` text, visible to the Peer seat.
+    pub last_answer: Option<String>,
+    /// The verified `Candidate` commit of the latest accepted handback.
+    pub candidate: Option<String>,
+    /// Unix-seconds timestamp of the handback that is still unread by the Lead
+    /// (feeds the unread-handback Attention Letter).
+    pub handed_back_at: Option<u64>,
 }
 
 impl Assignment {
@@ -356,6 +380,9 @@ impl Assignment {
             "thinkingReason": self.thinking_reason,
             "correlation": self.correlation,
             "workspace": self.workspace,
+            "lastAnswer": self.last_answer,
+            "candidate": self.candidate,
+            "handedBackAt": self.handed_back_at,
         })
     }
 }
@@ -370,9 +397,15 @@ pub struct RuntimeState {
 
 impl RuntimeState {
     pub fn load(ledger: &Ledger) -> Self {
+        Self::from_events(&ledger.read_events())
+    }
+
+    /// Rebuilds the projection from raw ledger events (used by the evidence
+    /// recorder, which reads ledgers without a project root).
+    pub fn from_events(events: &[Value]) -> Self {
         let mut state = Self::default();
-        for event in ledger.read_events() {
-            state.apply(&event);
+        for event in events {
+            state.apply(event);
         }
         state
     }
@@ -417,6 +450,9 @@ impl RuntimeState {
                         thinking_reason: opt_str_field(event, "thinkingReason"),
                         correlation: None,
                         workspace: None,
+                        last_answer: None,
+                        candidate: None,
+                        handed_back_at: None,
                     },
                 );
             }
@@ -439,6 +475,23 @@ impl RuntimeState {
                 if let Some(a) = self.assignments.get_mut(id) {
                     a.correlation = opt_str_field(event, "correlation");
                     a.workspace = opt_str_field(event, "workspace");
+                    if let Some(next) = transition(&a.state, kind) {
+                        a.state = next.to_string();
+                    }
+                }
+            }
+            "assignment_answered" => {
+                if let Some(a) = self.assignments.get_mut(id) {
+                    a.last_answer = opt_str_field(event, "answer");
+                    if let Some(next) = transition(&a.state, kind) {
+                        a.state = next.to_string();
+                    }
+                }
+            }
+            "assignment_handed_back" => {
+                if let Some(a) = self.assignments.get_mut(id) {
+                    a.candidate = opt_str_field(event, "candidate");
+                    a.handed_back_at = event.get("ts").and_then(Value::as_u64);
                     if let Some(next) = transition(&a.state, kind) {
                         a.state = next.to_string();
                     }
@@ -1035,4 +1088,296 @@ fn gate_run(ledger: &Ledger, args: &Value) -> Result<Value, RpcError> {
         "status": "pending",
         "note": "gate execution is delivered by the detached Gate runner"
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Peer tools (server-derived identity; spec user stories 23-24)
+// ---------------------------------------------------------------------------
+
+/// Structured `Challenge Signal` stances a Peer may raise via `ask`
+/// (spec: Role-Asymmetric MCP Surface, Peer paragraph).
+pub const CHALLENGE_SIGNALS: &[&str] = &["REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"];
+
+/// Argument keys a Peer tool call must never carry: identity, assignment, and
+/// workspace are resolved server-side from the session correlation, never from
+/// tool arguments (spec user story 23).
+const PEER_IDENTITY_ARG_KEYS: &[&str] = &[
+    "assignment",
+    "assignment_id",
+    "seat",
+    "workspace",
+    "correlation",
+    "project",
+];
+
+/// Refuses any peer tool call that tries to supply its own identity binding.
+fn refuse_identity_args(tool: &str, args: &Value) -> Result<(), RpcError> {
+    for key in PEER_IDENTITY_ARG_KEYS {
+        if args.get(key).is_some_and(|v| !v.is_null()) {
+            return Err(RpcError::invalid_params(format!(
+                "{tool}: `{key}` in tool args is refused: identity, assignment, and workspace are derived server-side from the session correlation"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the peer's binding server-side: the most recently dispatched
+/// assignment registered with this correlation (the binding is written by
+/// `assignment_dispatch`), together with its workspace.
+fn resolve_peer_binding(
+    ledger: &Ledger,
+    tool: &str,
+    correlation: Option<&str>,
+) -> Result<Assignment, RpcError> {
+    let Some(correlation) = correlation.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Err(RpcError::invalid_params(format!(
+            "{tool}: peer identity requires a session correlation (--correlation / HOTPOT_CORRELATION, injected at seat launch); the server never derives identity from tool arguments"
+        )));
+    };
+    let state = RuntimeState::load(ledger);
+    // The latest `assignment_dispatched` event carrying this correlation wins:
+    // the ledger, not the caller, decides which assignment the seat works on.
+    let bound = ledger
+        .read_events()
+        .iter()
+        .rev()
+        .find(|e| {
+            e.get("type").and_then(Value::as_str) == Some("assignment_dispatched")
+                && e.get("correlation").and_then(Value::as_str) == Some(correlation)
+        })
+        .and_then(|e| e.get("assignment").and_then(Value::as_str))
+        .and_then(|id| state.assignment(id));
+    let assignment = bound.ok_or_else(|| {
+        RpcError::invalid_params(format!(
+            "{tool}: correlation `{correlation}` is not bound to any dispatched assignment in this project"
+        ))
+    })?;
+    if assignment
+        .workspace
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(RpcError::internal(format!(
+            "{tool}: the binding for correlation `{correlation}` records no workspace; re-dispatch the assignment"
+        )));
+    }
+    Ok(assignment.clone())
+}
+
+/// Peer `ask`: raises a question (optionally a structured `Challenge Signal`)
+/// for the Lead as a ledger event answerable via `assignment_answer`.
+fn peer_ask(ledger: &Ledger, correlation: Option<&str>, args: &Value) -> Result<Value, RpcError> {
+    const TOOL: &str = "ask";
+    refuse_identity_args(TOOL, args)?;
+    let question = arg_str(args, TOOL, "question")?;
+    let signal = match args.get("signal") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let value = s.trim();
+            if CHALLENGE_SIGNALS.contains(&value) {
+                Some(value.to_string())
+            } else {
+                return Err(RpcError::invalid_params(format!(
+                    "{TOOL}: invalid Challenge Signal `{value}`: permitted signals are {}",
+                    CHALLENGE_SIGNALS.join("|")
+                )));
+            }
+        }
+        Some(_) => {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: `signal` must be a Challenge Signal string ({})",
+                CHALLENGE_SIGNALS.join("|")
+            )))
+        }
+    };
+
+    let asg = resolve_peer_binding(ledger, TOOL, correlation)?;
+    require_state(TOOL, "asking", &asg, &["Dispatched", "Asking"])?;
+
+    let mut event = json!({
+        "type": "assignment_asked",
+        "assignment": asg.id,
+        "correlation": asg.correlation,
+        "question": question,
+    });
+    if let Some(signal) = &signal {
+        event["signal"] = json!(signal);
+    }
+    ledger
+        .append(event)
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+
+    let reloaded = RuntimeState::load(ledger)
+        .assignment(&asg.id)
+        .expect("assignment exists before its lifecycle event")
+        .clone();
+    let mut result = json!({
+        "state": reloaded.state,
+        "question": question,
+        "routedTo": "lead",
+    });
+    if let Some(signal) = &signal {
+        result["signal"] = json!(signal);
+    }
+    if let Some(answer) = &reloaded.last_answer {
+        result["lastAnswer"] = json!(answer);
+    }
+    Ok(result)
+}
+
+/// Peer `handoff`: submits finished work, validated against live Git evidence.
+///
+/// Writable assignments are validated in order (spec user story 24): a clean
+/// working tree, a `Candidate` derived from `baseCommit..HEAD` with at least one
+/// commit, the required Gate run after the peer's last write, and finally a
+/// `scope.exceeded` flag (not a refusal) for changed paths outside the declared
+/// Write Scope. Read-only assignments only require a clean tree and make no
+/// candidate or lease claims.
+fn peer_handoff(
+    ledger: &Ledger,
+    correlation: Option<&str>,
+    args: &Value,
+) -> Result<Value, RpcError> {
+    const TOOL: &str = "handoff";
+    refuse_identity_args(TOOL, args)?;
+    let summary = arg_str(args, TOOL, "summary")?;
+    let asg = resolve_peer_binding(ledger, TOOL, correlation)?;
+    require_state(
+        TOOL,
+        "handing back",
+        &asg,
+        &["Dispatched", "Asking", "ReworkRequested"],
+    )?;
+    let workspace = Path::new(asg.workspace.as_deref().unwrap_or_default());
+
+    // (1) Clean working tree in the peer's workspace.
+    let dirty = leases::porcelain_entries(workspace)?;
+    if !dirty.is_empty() {
+        let sample: Vec<String> = dirty.iter().take(3).cloned().collect();
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: git precondition failed: the working tree of {} is not clean (`git status --porcelain=v1 --untracked-files=all` reports {} entr{}): {}; commit or revert everything before handing back",
+            workspace.display(),
+            dirty.len(),
+            if dirty.len() == 1 { "y" } else { "ies" },
+            sample.join(", ")
+        )));
+    }
+
+    // Read-only assignments (no Write Scope) claim neither candidate nor lease.
+    if asg.write_scope.is_empty() {
+        ledger
+            .append(json!({
+                "type": "assignment_handed_back",
+                "assignment": asg.id,
+                "correlation": asg.correlation,
+                "summary": summary,
+            }))
+            .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+        let reloaded = RuntimeState::load(ledger)
+            .assignment(&asg.id)
+            .expect("assignment exists before its lifecycle event")
+            .clone();
+        return Ok(json!({
+            "state": reloaded.state,
+            "assignment": asg.id,
+            "candidate": Value::Null,
+            "readOnly": true,
+            "handedBackAt": reloaded.handed_back_at,
+        }));
+    }
+
+    // (2) Candidate: at least one commit in baseCommit..HEAD.
+    let candidate = leases::head_commit(workspace)?;
+    let range = format!("{}..{}", asg.base_commit, candidate);
+    let count = workspace_git(workspace, &["rev-list", "--count", &range])?
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    if count == 0 {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: no Candidate: the workspace HEAD `{candidate}` has no commits past the assignment baseCommit `{}`; baseCommit..HEAD must contain at least one commit before handing back",
+            asg.base_commit
+        )));
+    }
+
+    // (3) The required Gate ran after the peer's last write (ledger evidence).
+    let events = ledger.read_events();
+    let last_write = evidence::latest_evidence_seq(&events, &asg.id, evidence::WRITE_EVENT);
+    let last_gate = evidence::latest_evidence_seq(&events, &asg.id, evidence::GATE_EVENT);
+    match (last_gate, last_write) {
+        (None, _) => {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: gate precondition failed: no gate-run record for `{}`; run the assignment Gate (`{}`) in the workspace after the last write, then hand off again",
+                asg.id, asg.gate
+            )));
+        }
+        (Some(gate), Some(write)) if gate < write => {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: gate precondition failed: the Gate last ran before the peer's last write (gate seq {gate} < write seq {write}); re-run the Gate (`{}`) after the final write, then hand off again",
+                asg.gate
+            )));
+        }
+        _ => {}
+    }
+
+    // (4) Changed paths outside the declared Write Scope are flagged, not refused.
+    let changed = workspace_git(workspace, &["diff", "--name-only", &range])?;
+    let violations: Vec<String> = changed
+        .lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter(|p| !asg.write_scope.iter().any(|glob| leases::glob_matches(glob, p)))
+        .map(str::to_string)
+        .collect();
+
+    let mut event = json!({
+        "type": "assignment_handed_back",
+        "assignment": asg.id,
+        "correlation": asg.correlation,
+        "summary": summary,
+        "candidate": candidate,
+        "baseCommit": asg.base_commit,
+    });
+    if !violations.is_empty() {
+        event["scopeViolations"] = json!(violations);
+    }
+    ledger
+        .append(event)
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+
+    let reloaded = RuntimeState::load(ledger)
+        .assignment(&asg.id)
+        .expect("assignment exists before its lifecycle event")
+        .clone();
+    Ok(json!({
+        "state": reloaded.state,
+        "assignment": asg.id,
+        "candidate": candidate,
+        "baseCommit": asg.base_commit,
+        "range": range,
+        "scope": {"exceeded": !violations.is_empty(), "paths": violations},
+        "handedBackAt": reloaded.handed_back_at,
+    }))
+}
+
+/// Runs `git -C <workspace> <args..>` and returns trimmed stdout on success.
+fn workspace_git(workspace: &Path, args: &[&str]) -> Result<String, RpcError> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .map_err(|e| RpcError::internal(format!("failed to invoke git: {e}")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(RpcError::internal(format!(
+            "git {:?} failed in {}: {}",
+            args,
+            workspace.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
