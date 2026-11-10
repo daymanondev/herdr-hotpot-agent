@@ -37,12 +37,12 @@ echo "  Installed binary: ${BIN_DIR}/hotpot"
 echo "==> [3/4] Installing Herdr layout and mods into ${HERDR_ROOT}..."
 mkdir -p "${HERDR_ROOT}/layouts" "${HERDR_ROOT}/mods/hotpot" "${HERDR_ROOT}/mods/hotpot-session"
 cp "${REPO_ROOT}/layouts/hotpot.json" "${HERDR_ROOT}/layouts/hotpot.json"
-cp "${REPO_ROOT}/mods/hotpot/mod.json" "${HERDR_ROOT}/mods/hotpot/mod.json"
-cp "${REPO_ROOT}/mods/hotpot/main.js" "${HERDR_ROOT}/mods/hotpot/main.js"
-cp "${REPO_ROOT}/mods/hotpot/protocol.js" "${HERDR_ROOT}/mods/hotpot/protocol.js"
-cp "${REPO_ROOT}/mods/hotpot-session/mod.json" "${HERDR_ROOT}/mods/hotpot-session/mod.json"
-cp "${REPO_ROOT}/mods/hotpot-session/main.js" "${HERDR_ROOT}/mods/hotpot-session/main.js"
-cp "${REPO_ROOT}/mods/hotpot-session/protocol.js" "${HERDR_ROOT}/mods/hotpot-session/protocol.js"
+# Every synced JS file ships (protocol.js, chrome.js, ...), not a hand-picked list,
+# so a newly shared module cannot go missing from an installed mod.
+for mod in hotpot hotpot-session; do
+  cp "${REPO_ROOT}/mods/${mod}/"*.js "${HERDR_ROOT}/mods/${mod}/"
+  cp "${REPO_ROOT}/mods/${mod}/mod.json" "${HERDR_ROOT}/mods/${mod}/mod.json"
+done
 
 echo "==> [4/4] Verifying hotpot binary..."
 "${BIN_DIR}/hotpot" status >/dev/null
