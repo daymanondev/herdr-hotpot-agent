@@ -72,6 +72,17 @@ fn instruction_artifact_rel(agent: &str, role: &str) -> String {
     }
 }
 
+/// The config file that declares the seat's own credential and session-history paths
+/// (Claude keeps MCP wiring in `mcp.json` and seat settings in `settings.json`).
+fn declarations_config_rel(agent: &str, role: &str) -> String {
+    match agent {
+        "codex" => format!("roles/codex/{role}/config.json"),
+        "claude" => format!("roles/claude/{role}/settings.json"),
+        "pi" => format!("roles/pi/{role}/settings.json"),
+        other => panic!("unknown agent {other}"),
+    }
+}
+
 /// Minimal PATH so the real operator environment can never leak into these tests; fake vendor
 /// and `hc` binaries live in a prepended temp bin dir.
 fn sandbox_path(fake_bin: Option<&Path>) -> String {
@@ -372,6 +383,224 @@ fn codex_config_is_additive_and_replaces_no_base_system_prompt_field() {
         assert!(
             obj.contains_key("developer_instructions"),
             "codex {role} config must carry the additive developer_instructions channel"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance criterion 3: per-seat file-backed credentials and session history
+// (story 3).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn each_seat_declares_distinct_file_backed_credentials_inside_its_role_home() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    run_setup_apply(home.path(), fake_home.path(), &[]);
+
+    let mut credential_paths: BTreeSet<String> = BTreeSet::new();
+    let mut history_paths: BTreeSet<String> = BTreeSet::new();
+    for (agent, role) in seats() {
+        let config = read_json(&home.path().join(declarations_config_rel(agent, role)));
+        let role_home = home.path().join("roles").join(agent).join(role);
+        let credential = config["credentials_file"].as_str().unwrap_or_else(|| {
+            panic!("{agent}/{role} config must declare its own credentials_file path")
+        });
+        let history = config["session_history_file"].as_str().unwrap_or_else(|| {
+            panic!("{agent}/{role} config must declare its own session_history_file path")
+        });
+
+        assert!(
+            Path::new(credential).starts_with(&role_home),
+            "{agent}/{role} credential path {credential} must live inside its own Role Home"
+        );
+        assert!(
+            Path::new(history).starts_with(&role_home),
+            "{agent}/{role} session-history path {history} must live inside its own Role Home"
+        );
+        credential_paths.insert(credential.to_string());
+        history_paths.insert(history.to_string());
+    }
+
+    assert_eq!(
+        credential_paths.len(),
+        9,
+        "the nine credential paths must be pairwise distinct: {credential_paths:?}"
+    );
+    assert_eq!(
+        history_paths.len(),
+        9,
+        "the nine session-history paths must be pairwise distinct: {history_paths:?}"
+    );
+}
+
+#[test]
+fn no_symlink_under_roles_ever_targets_an_operator_home_file() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let sentinels = plant_operator_sentinels(fake_home.path());
+    run_setup_apply(home.path(), fake_home.path(), &[]);
+
+    // Walk every entry under roles/; any symlink must not resolve into the fake operator
+    // home (mutable operator credential files are never symlinked into a Role Home).
+    let mut stack = vec![home.path().join("roles")];
+    let mut symlink_count = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() && !path.is_symlink() {
+                stack.push(path);
+                continue;
+            }
+            if path.is_symlink() {
+                symlink_count += 1;
+                let target = fs::read_link(&path).unwrap();
+                let resolved = if target.is_absolute() {
+                    target.clone()
+                } else {
+                    path.parent().unwrap().join(target)
+                };
+                assert!(
+                    !resolved.starts_with(fake_home.path()),
+                    "symlink {} targets the operator home ({})",
+                    path.display(),
+                    resolved.display()
+                );
+            }
+        }
+    }
+    // The provisioned roles/ tree is entirely regular files and directories.
+    assert_eq!(
+        symlink_count, 0,
+        "setup must not plant any symlink under roles/"
+    );
+    assert_operator_sentinels_unchanged(&sentinels);
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance criterion 4: hotpot.json carries a deterministic contract digest.
+// ---------------------------------------------------------------------------
+
+/// Reads `role_contract_digest` out of a provisioned `hotpot.json`.
+fn marker_digest(home: &Path) -> String {
+    let marker = read_json(&home.join("hotpot.json"));
+    assert_eq!(marker["marker"].as_str(), Some("hotpot"));
+    marker["role_contract_digest"]
+        .as_str()
+        .expect("hotpot.json carries role_contract_digest")
+        .to_string()
+}
+
+#[test]
+fn hotpot_json_digest_is_deterministic_and_tweak_sensitive() {
+    let home_a = TempDir::new("dig1");
+    let home_b = TempDir::new("dig2");
+    let fake_home = TempDir::new("fakehome");
+
+    // Same contract input (identical built-in contracts) → identical digest, valid hex.
+    run_setup_apply(home_a.path(), fake_home.path(), &[]);
+    run_setup_apply(home_b.path(), fake_home.path(), &[]);
+    let digest_a = marker_digest(home_a.path());
+    let digest_b = marker_digest(home_b.path());
+    assert_eq!(digest_a, digest_b, "same contract input must yield the same digest");
+    assert!(
+        !digest_a.is_empty() && digest_a.chars().all(|c| c.is_ascii_hexdigit()),
+        "digest must be non-empty hex: {digest_a}"
+    );
+
+    // A tweaked contract body (via HOTPOT_CONTRACTS_DIR) → a different digest.
+    let contracts_dir = TempDir::new("contracts");
+    fs::write(
+        contracts_dir.path().join("peer.md"),
+        "## role-peer\n\nTweaked peer body: escalated challenge discipline for this test.\n"
+            .to_string(),
+    )
+    .unwrap();
+    let tweaked = TempDir::new("dig3");
+    run_setup_apply(
+        tweaked.path(),
+        fake_home.path(),
+        &[("HOTPOT_CONTRACTS_DIR", &contracts_dir.path().to_string_lossy().into_owned())],
+    );
+    let digest_tweaked = marker_digest(tweaked.path());
+    assert_ne!(
+        digest_tweaked, digest_a,
+        "a tweaked contract body must change the digest"
+    );
+
+    // The override replaces only the role body: shared layers are still delivered, and the
+    // untweaked roles keep the baseline digest input (their artifacts are byte-identical).
+    let peer_contract = delivered_contract(tweaked.path(), "pi", "peer");
+    assert!(
+        peer_contract.contains("Tweaked peer body"),
+        "the overridden body must be delivered to the seat:\n{peer_contract}"
+    );
+    for layer in ["shared-authority", "shared-seat-identity", "challenge-signals"] {
+        assert!(
+            peer_contract.contains(layer),
+            "the tweaked contract must still carry the {layer} layer:\n{peer_contract}"
+        );
+    }
+    assert_eq!(
+        delivered_contract(tweaked.path(), "codex", "supervisor"),
+        delivered_contract(home_a.path(), "codex", "supervisor"),
+        "roles without an override keep the built-in contract"
+    );
+}
+
+#[test]
+fn hotpot_json_records_runtime_opt_in_state() {
+    let home = TempDir::new("optin");
+    let fake_home = TempDir::new("fakehome");
+
+    run_setup_apply(home.path(), fake_home.path(), &[]);
+    let marker = read_json(&home.path().join("hotpot.json"));
+    assert_eq!(
+        marker["runtime_opt_in"].as_bool(),
+        Some(false),
+        "runtime coordination must be opt-in (off by default)"
+    );
+
+    let opted_in = TempDir::new("optin2");
+    run_setup_apply(opted_in.path(), fake_home.path(), &[("HOTPOT_RUNTIME_OPT_IN", "1")]);
+    let marker = read_json(&opted_in.path().join("hotpot.json"));
+    assert_eq!(marker["runtime_opt_in"].as_bool(), Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance criterion 5: AUTHENTICATION.md lists every seat's login command, no secrets.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn authentication_md_lists_one_login_command_per_seat_without_secrets() {
+    let home = TempDir::new("authmd");
+    let fake_home = TempDir::new("fakehome");
+    plant_operator_sentinels(fake_home.path());
+    run_setup_apply(home.path(), fake_home.path(), &[]);
+
+    let text = fs::read_to_string(home.path().join("AUTHENTICATION.md"))
+        .expect("AUTHENTICATION.md exists at the Hotpot Home root");
+
+    let commands: BTreeSet<String> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter_map(|l| l.strip_prefix("hotpot auth login ").map(|rest| rest.to_string()))
+        .map(|seat| format!("hotpot auth login {seat}"))
+        .collect();
+    let expected: BTreeSet<String> = seats()
+        .into_iter()
+        .map(|(agent, role)| format!("hotpot auth login {agent} {role}"))
+        .collect();
+    assert_eq!(
+        commands, expected,
+        "AUTHENTICATION.md must list exactly one login command per seat"
+    );
+
+    // No secrets: none of the planted operator credential fixture contents may appear.
+    for i in 0..3 {
+        assert!(
+            !text.contains(&format!("operator-secret-{i}")),
+            "AUTHENTICATION.md must not leak credential contents"
         );
     }
 }
