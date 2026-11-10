@@ -9,26 +9,49 @@ import assert from "node:assert/strict";
 import * as protocol from "../../shared/protocol.js";
 
 // ---------------------------------------------------------------------------
-// Kind → icon / label mapping
+// Kind → icon-descriptor / label mapping (ticket 08: zero emoji characters)
 // ---------------------------------------------------------------------------
 
-test("kind mapping yields the spec icons for thinking, tool_call, and notices", () => {
-  assert.equal(protocol.transcriptKindMeta("thinking").icon, "💭");
-  assert.equal(protocol.transcriptKindMeta("tool_call").icon, "🔧");
-  assert.equal(protocol.transcriptKindMeta("notice").icon, "📩");
+test("kind mapping yields vector chrome icon descriptors for thinking and tool_call", () => {
+  assert.deepEqual(protocol.transcriptKindMeta("thinking").icon, {
+    kind: "chrome",
+    icon: "mods/workspace-chrome/layers.svg",
+    tint: true,
+  });
+  assert.deepEqual(protocol.transcriptKindMeta("tool_call").icon, {
+    kind: "chrome",
+    icon: "mods/workspace-chrome/terminal.svg",
+    tint: true,
+  });
 });
 
-test("kind mapping maps attention and assignment notice kinds to the notice icon", () => {
+test("notices carry no icon and messages carry the vendor-icon marker", () => {
+  assert.equal(protocol.transcriptKindMeta("notice").icon, null);
+  assert.deepEqual(protocol.transcriptKindMeta("message").icon, { kind: "vendor" });
   for (const kind of ["attention", "attention_notice", "assignment_notice", "mailbox"]) {
-    assert.equal(protocol.transcriptKindMeta(kind).icon, "📩", `kind ${kind}`);
+    assert.equal(protocol.transcriptKindMeta(kind).icon, null, `notice kind ${kind}`);
   }
 });
 
-test("kind mapping labels every known kind without an empty label", () => {
-  for (const kind of ["thinking", "tool_call", "notice", "attention", "message"]) {
+test("kind metadata never carries an emoji character and labels every kind", () => {
+  const EMOJI = /\p{Extended_Pictographic}/u;
+  const kinds = [
+    "thinking",
+    "tool_call",
+    "notice",
+    "attention",
+    "attention_notice",
+    "assignment_notice",
+    "mailbox",
+    "message",
+    "weird-unknown",
+    "",
+  ];
+  for (const kind of kinds) {
     const meta = protocol.transcriptKindMeta(kind);
-    assert.ok(meta.label.length > 0, `kind ${kind} has a label`);
-    assert.ok(meta.icon.length > 0, `kind ${kind} has an icon`);
+    assert.equal(EMOJI.test(JSON.stringify(meta)), false, `kind ${kind} has no emoji`);
+    assert.equal(typeof meta.label, "string");
+    assert.ok(meta.label.length > 0, `kind ${kind || "empty"} still renders a label`);
   }
 });
 
