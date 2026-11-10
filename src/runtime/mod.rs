@@ -287,9 +287,7 @@ fn call_tool(
         "assignment_close" => assignment_close(ledger, args),
         "gate_run" => gate_run(ledger, args),
         "workspace_close" => workspace_close(ledger, project_root, args),
-        "lease_reclaim" => Err(RpcError::not_implemented(
-            "`lease_reclaim` semantics land with the stale-lease reclaim slice",
-        )),
+        "lease_reclaim" => lease_reclaim(ledger, args),
         "ask" | "handoff" => Err(RpcError::not_implemented(format!(
             "`{tool}` semantics land with the peer identity slice; the correlation -> assignment binding is registered at assignment_dispatch"
         ))),
@@ -924,6 +922,44 @@ fn workspace_close(
         .expect("assignment exists before its lifecycle event")
         .to_json();
     result["lease"] = json!({"released": true, "worktreeAction": action});
+    Ok(result)
+}
+
+/// `lease_reclaim`: Lead force-reclaims a stale Writer Lease, appending an audit
+/// event and freeing the writer slot. The isolated worktree, if any, stays on
+/// disk for Lead to integrate or discard deliberately.
+fn lease_reclaim(ledger: &Ledger, args: &Value) -> Result<Value, RpcError> {
+    const TOOL: &str = "lease_reclaim";
+    let id = arg_str(args, TOOL, "assignment")?;
+    let state = RuntimeState::load(ledger);
+    let lease = state
+        .lease_for(&id)
+        .ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "{TOOL}: no active writer lease for `{id}`; lease_reclaim force-frees a held lease"
+            ))
+        })?
+        .clone();
+
+    ledger
+        .append(json!({
+            "type": "writer_lease_reclaimed",
+            "assignment": id,
+            "mode": lease.mode,
+            "worktreeAction": "retained",
+        }))
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    let state = RuntimeState::load(ledger);
+    let mut result = state
+        .assignment(&id)
+        .expect("assignment exists before its lifecycle event")
+        .to_json();
+    result["lease"] = json!({
+        "reclaimed": true,
+        "mode": lease.mode,
+        "worktree": lease.worktree,
+        "worktreeAction": "retained",
+    });
     Ok(result)
 }
 

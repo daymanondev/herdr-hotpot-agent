@@ -525,3 +525,57 @@ fn workspace_close_cleans_in_flight_worktrees_and_retains_handed_back_candidates
         "double close names the missing lease: {message}"
     );
 }
+
+#[test]
+fn lease_reclaim_force_frees_a_stale_lease_with_an_audit_event() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+
+    let stale = create_assignment(&mut mcp, valid_create(&head));
+    let dispatched = mcp.tools_call(
+        json!(2),
+        "assignment_dispatch",
+        json!({"assignment": stale}),
+    );
+    assert!(dispatched.get("error").is_none(), "{dispatched}");
+
+    // Lead force-reclaims the stale lease; the reclaim is an audit event.
+    let reclaimed = mcp.tools_call(
+        json!(3),
+        "lease_reclaim",
+        json!({"assignment": stale}),
+    );
+    assert!(
+        reclaimed.get("error").is_none(),
+        "lease_reclaim on a held lease: {reclaimed}"
+    );
+    assert_eq!(reclaimed["result"]["lease"]["reclaimed"], json!(true));
+    let events = ledger_events_of_type(home.path(), "writer_lease_reclaimed");
+    assert_eq!(events.len(), 1, "exactly one reclaim audit event");
+    assert_eq!(events[0]["assignment"], json!(stale));
+
+    // The freed lease admits a fresh exclusive dispatch.
+    let fresh = create_assignment(&mut mcp, valid_create(&head));
+    let exclusive = mcp.tools_call(
+        json!(4),
+        "assignment_dispatch",
+        json!({"assignment": fresh}),
+    );
+    assert!(
+        exclusive.get("error").is_none(),
+        "a reclaimed lease frees the checkout writer slot: {exclusive}"
+    );
+
+    // Reclaiming with no held lease is an error.
+    let again = mcp.tools_call(
+        json!(5),
+        "lease_reclaim",
+        json!({"assignment": stale}),
+    );
+    let message = error_message(&again);
+    assert!(
+        message.contains("no active writer lease"),
+        "reclaim without a lease names the missing lease: {message}"
+    );
+}

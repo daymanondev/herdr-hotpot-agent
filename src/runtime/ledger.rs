@@ -10,6 +10,7 @@
 //! - `assignment_dispatched` { assignment, correlation, workspace }
 //! - `writer_lease_acquired` { assignment, mode, worktree?, cargoTargetDir?, worktreeInclude? }
 //! - `writer_lease_released` { assignment, worktreeAction }
+//! - `writer_lease_reclaimed` { assignment, mode, worktreeAction }
 //! - `assignment_asked`      { assignment, question }          (written by the peer `ask` path)
 //! - `assignment_answered`   { assignment, answer }
 //! - `assignment_handed_back`{ assignment, summary }           (written by the peer `handoff` path)
