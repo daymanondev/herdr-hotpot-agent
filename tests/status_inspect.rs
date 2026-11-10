@@ -454,12 +454,14 @@ fn status_on_an_empty_home_exits_zero_with_empty_arrays() {
     // their timer fallback instead of subscribing to a missing directory.
     assert_eq!(status["runtimeDir"], Value::Null, "runtimeDir stays null on an empty home");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    // `claude-opus-4-6` left this list with ticket nui/01: it is now a
+    // legitimate built-in profile default served in `profiles` on a fresh
+    // Project, not a leaked mock.
     for mock in [
         "seat-supervisor",
         "seat-lead",
         "T-01",
         "peer-T-01",
-        "claude-opus-4-6",
         "gpt-5.4",
         "Conversational Owner delegate",
     ] {
@@ -823,4 +825,130 @@ fn seat_launch_records_the_seat_and_status_projects_it_without_hc() {
     assert_eq!(lead["agent"], json!("codex"));
     assert_eq!(lead["status"], json!("offline"));
     assert_eq!(lead["terminal"], Value::Null);
+}
+
+// ---------------------------------------------------------------------------
+// Ticket nui/01 — backward-compatible status metadata: `provisioned`,
+// `hasWorkspaceProtocol`, and the resolved `profiles` defaults
+// ---------------------------------------------------------------------------
+
+/// Runs `hotpot status` against `home`/`repo` and returns the parsed snapshot.
+fn status_for(home: &Path, repo: &Path) -> Value {
+    let out = run_hotpot(
+        home,
+        &[
+            "status",
+            "--workspace",
+            &repo.to_string_lossy(),
+            "--state-dir",
+            &home.to_string_lossy(),
+        ],
+        &[("HOTPOT_HC", home.join("missing-hc").to_string_lossy().into_owned())],
+    );
+    status_json(&out)
+}
+
+#[test]
+fn status_serves_markers_and_builtin_profile_defaults_on_a_fresh_project() {
+    let home = TempDir::new("home");
+    let (repo, _head) = init_git_repo();
+
+    // Fresh Project: neither marker exists, yet every role still resolves to a
+    // concrete default profile (the panel's always-present Seat Slots).
+    let status = status_for(home.path(), repo.path());
+    assert_eq!(
+        status["provisioned"],
+        json!(false),
+        "no `hotpot.json` marker in Hotpot Home yet"
+    );
+    assert_eq!(
+        status["hasWorkspaceProtocol"],
+        json!(false),
+        "no WORKSPACE_PROTOCOL.md at the Project root yet"
+    );
+    assert_eq!(
+        status["profiles"],
+        json!({
+            "supervisor": {"agent": "claude", "model": "claude-opus-4-6", "thinking": "high"},
+            "lead": {"agent": "codex", "model": "gpt-5.1-codex", "thinking": "high"},
+            "peer": {"agent": "codex", "model": "gpt-5.1-codex", "thinking": "medium"},
+        }),
+        "the three roles resolve to the built-in defaults"
+    );
+    // Backward compatibility: the recorded surfaces stay empty arrays.
+    for field in ["seats", "tasks", "attention", "mailbox"] {
+        assert_eq!(status[field], json!([]), "`{field}` stays an empty array");
+    }
+
+    // Each marker flips only its own flag: `hotpot.json` in Hotpot Home,
+    // `WORKSPACE_PROTOCOL.md` at the Project root.
+    fs::write(home.path().join("hotpot.json"), "{}\n").unwrap();
+    let status = status_for(home.path(), repo.path());
+    assert_eq!(status["provisioned"], json!(true));
+    assert_eq!(status["hasWorkspaceProtocol"], json!(false));
+
+    fs::write(repo.path().join("WORKSPACE_PROTOCOL.md"), "# Workspace Protocol\n").unwrap();
+    let status = status_for(home.path(), repo.path());
+    assert_eq!(status["provisioned"], json!(true));
+    assert_eq!(status["hasWorkspaceProtocol"], json!(true));
+}
+
+#[test]
+fn status_resolves_profiles_json_entries_per_field_over_the_builtins() {
+    let home = TempDir::new("home");
+    let (repo, _head) = init_git_repo();
+
+    // A hand-edited partial entry: only the Lead's model is set, so its agent
+    // and thinking must still resolve from the built-ins.
+    fs::write(
+        home.path().join("profiles.json"),
+        json!({"lead": {"model": "x"}}).to_string(),
+    )
+    .unwrap();
+    let status = status_for(home.path(), repo.path());
+    assert_eq!(
+        status["profiles"]["lead"],
+        json!({"agent": "codex", "model": "x", "thinking": "high"}),
+        "the partial lead entry overrides only its model field"
+    );
+    assert_eq!(
+        status["profiles"]["supervisor"],
+        json!({"agent": "claude", "model": "claude-opus-4-6", "thinking": "high"}),
+        "untouched roles keep the built-in defaults"
+    );
+    assert_eq!(
+        status["profiles"]["peer"],
+        json!({"agent": "codex", "model": "gpt-5.1-codex", "thinking": "medium"}),
+    );
+
+    // The panel's write path — `hotpot profile set` (ticket 13) — surfaces the
+    // same way: a full supervisor entry lands, the lead override survives.
+    // (The subcommand resolves Hotpot Home from HOTPOT_HOME, which `run_hotpot`
+    // always sets.)
+    let out = run_hotpot(
+        home.path(),
+        &[
+            "profile",
+            "set",
+            "claude",
+            "supervisor",
+            "claude-sonnet-4-5",
+            "--thinking",
+            "low",
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "profile set exits 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status = status_for(home.path(), repo.path());
+    assert_eq!(
+        status["profiles"]["supervisor"],
+        json!({"agent": "claude", "model": "claude-sonnet-4-5", "thinking": "low"}),
+        "the profile set write resolves as the supervisor defaults"
+    );
+    assert_eq!(status["profiles"]["lead"]["model"], json!("x"));
+    assert_eq!(status["profiles"]["peer"]["model"], json!("gpt-5.1-codex"));
 }
