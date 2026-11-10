@@ -390,6 +390,80 @@ pub fn hotpot_marker_contents() -> String {
         + "\n"
 }
 
+/// Finds role-owned credential files under `<home>/roles/` so `hotpot remove` can warn
+/// before deleting them.
+pub fn find_role_credential_files(home: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![home.join("roles")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && !path.is_symlink() {
+                stack.push(path);
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && CREDENTIAL_FILE_NAMES.contains(&name)
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// True when the preserve-only runtime state tree holds at least one entry (active runtime).
+pub fn runtime_state_active(home: &Path) -> bool {
+    fs::read_dir(home.join(RUNTIME_STATE_DIR))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Every path under `home` (children first) followed by `home` itself — the deletion list
+/// printed by `hotpot remove`.
+pub fn removal_paths(home: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() && !path.is_symlink() {
+                walk(&path, out);
+            }
+            out.push(path);
+        }
+    }
+    let mut out = Vec::new();
+    walk(home, &mut out);
+    out.push(home.to_path_buf());
+    out
+}
+
+/// Refuses to tear down implausible roots (the filesystem root or `$HOME` itself).
+pub fn guard_removal_root(home: &Path) -> Result<(), PlanError> {
+    let home = normalize(home);
+    if home == Path::new("/") {
+        return Err(PlanError::new(
+            "remove-refused",
+            "refusing to remove the filesystem root",
+        ));
+    }
+    if let Some(raw) = env::var_os("HOME")
+        && !raw.is_empty()
+        && normalize(&PathBuf::from(raw)) == home
+    {
+        return Err(PlanError::new(
+            "remove-refused",
+            format!("refusing to remove HOME itself ({})", home.display()),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the base Hotpot Home plan: the home skeleton directories plus the `hotpot.json`
 /// marker. `runtime/` is never part of a plan (preserve-only); `hc` profile changes are only
 /// planned when `hc` is discoverable on `PATH`. Later tickets plug Role Home, hygiene, and

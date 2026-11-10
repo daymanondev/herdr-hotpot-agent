@@ -313,3 +313,137 @@ fn setup_apply_invokes_hc_with_the_planned_profile_change() {
     assert!(home.path().join("hotpot.json").exists());
 }
 
+#[test]
+fn setup_apply_preserves_preexisting_runtime_state() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let ledger = home.path().join("runtime/v1/ledger.jsonl");
+    fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    fs::write(&ledger, "{\"seq\":1,\"type\":\"room_opened\"}\n").unwrap();
+
+    let dry = run_hotpot(home.path(), fake_home.path(), None, &["setup"]);
+    assert!(dry.status.success());
+    let stdout = stdout_of(&dry);
+    assert!(
+        !stdout.contains("runtime"),
+        "runtime/ is preserve-only and must never appear in the plan:\n{stdout}"
+    );
+
+    let out = run_hotpot(home.path(), fake_home.path(), None, &["setup", "--apply"]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+
+    let bytes = fs::read(&ledger).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "{\"seq\":1,\"type\":\"room_opened\"}\n",
+        "a pre-existing runtime/v1/ledger.jsonl must survive setup --apply byte-identically"
+    );
+}
+
+#[test]
+fn remove_dry_run_warns_about_credentials_and_runtime_and_deletes_nothing() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+
+    // Provisioned home plus planted active runtime state and a role-owned credential fixture.
+    let out = run_hotpot(home.path(), fake_home.path(), None, &["setup", "--apply"]);
+    assert!(out.status.success());
+    let ledger = home.path().join("runtime/v1/ledger.jsonl");
+    fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    fs::write(&ledger, "{\"seq\":1,\"type\":\"room_opened\"}\n").unwrap();
+    let credential = home.path().join("roles/codex/supervisor/auth.json");
+    fs::create_dir_all(credential.parent().unwrap()).unwrap();
+    fs::write(&credential, "{\"token\":\"seat-secret\"}\n").unwrap();
+    let tree_before = relative_tree(home.path());
+
+    let out = run_hotpot(home.path(), fake_home.path(), None, &["remove"]);
+    assert!(
+        out.status.success(),
+        "remove dry-run must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stdout.contains("would remove"),
+        "remove dry-run must list planned deletions:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&ledger.display().to_string()),
+        "remove dry-run must list the runtime ledger among deletions:\n{stdout}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("credential"),
+        "remove must warn about role-owned credentials:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&credential.display().to_string()),
+        "the credential warning must name the credential file:\n{stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("active runtime state"),
+        "remove must warn about active runtime state when runtime/v1/ is non-empty:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("runtime/v1"),
+        "the runtime warning must name runtime/v1:\n{stderr}"
+    );
+
+    // Dry-run deletes nothing.
+    assert_eq!(
+        relative_tree(home.path()),
+        tree_before,
+        "remove dry-run must not delete anything"
+    );
+    assert!(credential.exists() && ledger.exists());
+}
+
+#[test]
+fn remove_apply_tears_down_hotpot_home() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let out = run_hotpot(home.path(), fake_home.path(), None, &["setup", "--apply"]);
+    assert!(out.status.success());
+    let ledger = home.path().join("runtime/v1/ledger.jsonl");
+    fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    fs::write(&ledger, "{\"seq\":1}\n").unwrap();
+
+    let out = run_hotpot(home.path(), fake_home.path(), None, &["remove", "--apply"]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        !home.path().join("hotpot.json").exists(),
+        "remove --apply must remove the provisioned Hotpot Home contents"
+    );
+    assert!(
+        !home.path().join("roles").exists() && !ledger.exists(),
+        "remove --apply must tear down the whole Hotpot Home"
+    );
+}
+
+#[test]
+fn remove_on_missing_home_is_a_clean_no_op() {
+    let fake_home = TempDir::new("fakehome");
+    let missing = fake_home.path().join("no-such-hotpot-home");
+
+    let out = run_hotpot(&missing, fake_home.path(), None, &["remove"]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(!missing.exists());
+}
+
+
