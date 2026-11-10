@@ -180,3 +180,52 @@ fn head_moved_past_base_commit_refuses_dispatch() {
         "no lease event is appended on a refused dispatch"
     );
 }
+
+#[test]
+fn read_only_assignment_acquires_no_lease() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+
+    // A Reviewer with no Write Scope is read-only: it acquires no Writer Lease,
+    // so its dispatch is valid even while the tree is dirty.
+    let mut reviewer = valid_create(&head);
+    reviewer["disposition"] = json!("Reviewer");
+    reviewer["writeScope"] = json!([]);
+    reviewer["serialOnly"] = json!([]);
+    std::fs::write(repo.path().join("untracked.txt"), "still fine for readers\n").unwrap();
+    let id = create_assignment(&mut mcp, reviewer);
+
+    let dispatched = mcp.tools_call(
+        json!(2),
+        "assignment_dispatch",
+        json!({"assignment": id}),
+    );
+    assert!(
+        dispatched.get("error").is_none(),
+        "read-only dispatch ignores checkout cleanliness: {dispatched}"
+    );
+    assert_eq!(dispatched["result"]["state"], "Dispatched");
+    assert!(
+        dispatched["result"].get("lease").is_none(),
+        "no lease is reported for a read-only assignment: {dispatched}"
+    );
+    assert!(
+        ledger_events_of_type(home.path(), "writer_lease_acquired").is_empty(),
+        "no lease event exists for a read-only dispatch"
+    );
+
+    // And it does not block the next writable exclusive dispatch.
+    let writable = create_assignment(&mut mcp, valid_create(&head));
+    git(repo.path(), &["clean", "-fdq"]);
+    let exclusive = mcp.tools_call(
+        json!(4),
+        "assignment_dispatch",
+        json!({"assignment": writable}),
+    );
+    assert!(
+        exclusive.get("error").is_none(),
+        "a read-only lease never blocks a writable dispatch: {exclusive}"
+    );
+    assert_eq!(exclusive["result"]["lease"]["mode"], "InCheckoutExclusive");
+}
