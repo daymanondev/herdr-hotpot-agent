@@ -7,7 +7,7 @@
 //!
 //! Event types written by this slice (`assignment` = assignment id):
 //! - `assignment_created`    { assignment, outcome, disposition, baseCommit, writeScope, serialOnly, gate, thinking?, thinkingReason? }
-//! - `assignment_dispatched` { assignment, correlation, workspace }
+//! - `assignment_dispatched` { assignment, correlation, workspace, agent?, model? }
 //! - `writer_lease_acquired` { assignment, mode, worktree?, cargoTargetDir?, worktreeInclude? }
 //! - `writer_lease_released` { assignment, worktreeAction }
 //! - `writer_lease_reclaimed` { assignment, mode, worktreeAction }
@@ -17,6 +17,7 @@
 //! - `workspace_gate`        { assignment, correlation, workspace, gate }   (runtime evidence, `hotpot hook`)
 //! - `assignment_handed_back`{ assignment, correlation, summary, candidate?, baseCommit?, scopeViolations? } (written by the peer `handoff` path)
 //! - `gate_started`          { assignment, gate }
+//! - `gate_completed`        { assignment, verdict, durationMs, exitCode?, reason?, tail? } (written by the detached gate runner; `tail` is the masked red tail path under Hotpot Home)
 //! - `assignment_accepted`   { assignment, note? }
 //! - `assignment_rejected`   { assignment, note? }
 //! - `assignment_stopped`    { assignment }
