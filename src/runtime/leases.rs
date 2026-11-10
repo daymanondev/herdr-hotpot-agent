@@ -284,11 +284,64 @@ pub fn provision_worktree(
         RpcError::internal(format!("failed to create shared CARGO_TARGET_DIR: {e}"))
     })?;
 
+    // Warm dependencies: symlink `.worktreeinclude` entries (e.g. node_modules)
+    // from the main checkout into the worktree.
+    let worktree_include = symlink_worktreeinclude(project_root, &worktree)?;
+
     Ok(WorktreeProvision {
         worktree,
         cargo_target_dir,
-        worktree_include: Vec::new(),
+        worktree_include,
     })
+}
+
+/// Reads `<project_root>/.worktreeinclude` entries: trimmed non-empty, non-comment
+/// lines naming checkout-relative paths that should be symlinked into isolated
+/// worktrees as a warm cache.
+fn read_worktreeinclude(project_root: &Path) -> Vec<String> {
+    std::fs::read_to_string(project_root.join(".worktreeinclude"))
+        .map(|content| {
+            content
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Symlinks each `.worktreeinclude` entry from the main checkout into the
+/// worktree; returns the entries actually linked. Entries missing in the main
+/// checkout, or already present in the worktree (e.g. tracked in git), are
+/// skipped — warm-caching is best-effort and never overrides checkout content.
+fn symlink_worktreeinclude(project_root: &Path, worktree: &Path) -> Result<Vec<String>, RpcError> {
+    let mut linked = Vec::new();
+    for entry in read_worktreeinclude(project_root) {
+        let source = project_root.join(&entry);
+        if !source.exists() {
+            continue;
+        }
+        let target = worktree.join(&entry);
+        if target.symlink_metadata().is_ok() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                RpcError::internal(format!(
+                    "failed to create parent dir for `{entry}` in the worktree: {e}"
+                ))
+            })?;
+        }
+        let canonical = std::fs::canonicalize(&source).map_err(|e| {
+            RpcError::internal(format!("failed to resolve `{entry}` in the checkout: {e}"))
+        })?;
+        std::os::unix::fs::symlink(&canonical, &target).map_err(|e| {
+            RpcError::internal(format!("failed to symlink `{entry}` into the worktree: {e}"))
+        })?;
+        linked.push(entry);
+    }
+    Ok(linked)
 }
 
 /// Removes an isolated worktree from disk and git's worktree registry.

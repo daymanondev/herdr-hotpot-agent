@@ -384,3 +384,68 @@ fn worktree_scope_overlap_and_serial_path_are_refused() {
         );
     }
 }
+
+#[test]
+fn worktree_peers_share_cargo_target_dir_and_worktreeinclude_symlinks() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+
+    // Fixture: `.worktreeinclude` names `node_modules` (gitignored, present in
+    // the main checkout) so worktrees get a warm symlink instead of a cold dir.
+    std::fs::write(repo.path().join(".gitignore"), "node_modules\n").unwrap();
+    std::fs::write(repo.path().join(".worktreeinclude"), "node_modules\n").unwrap();
+    std::fs::create_dir_all(repo.path().join("node_modules").join("left-pad")).unwrap();
+    std::fs::write(
+        repo.path().join("node_modules").join("left-pad").join("package.json"),
+        "{\"name\":\"left-pad\"}\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "fixture warm-cache entries"]);
+
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+    let expected_target = std::fs::canonicalize(repo.path().join("node_modules")).unwrap();
+
+    let first = create_assignment(&mut mcp, worktree_create(&head, &["src/engine/**"], &[]));
+    let dispatched = dispatch_worktree(&mut mcp, &first);
+    assert!(dispatched.get("error").is_none(), "{dispatched}");
+
+    // The shared CARGO_TARGET_DIR is recorded in the dispatch result and ledger.
+    let cargo_dir = dispatched["result"]["lease"]["cargoTargetDir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("worktree lease records cargoTargetDir: {dispatched}"))
+        .to_string();
+    assert_eq!(
+        std::path::PathBuf::from(&cargo_dir),
+        project_runtime_dir(home.path()).join("cache").join("cargo-target"),
+        "cargoTargetDir is the shared warm-build cache under Hotpot Home"
+    );
+    assert!(std::path::Path::new(&cargo_dir).is_dir(), "cache dir exists");
+    let acquired = ledger_events_of_type(home.path(), "writer_lease_acquired");
+    assert_eq!(acquired[0]["cargoTargetDir"], json!(cargo_dir));
+    assert_eq!(acquired[0]["worktreeInclude"], json!(["node_modules"]));
+
+    // The worktree's `node_modules` is a symlink into the main checkout.
+    let worktree = dispatched["result"]["lease"]["worktree"].as_str().unwrap();
+    let link = std::path::Path::new(worktree).join("node_modules");
+    let target = std::fs::read_link(&link)
+        .unwrap_or_else(|e| panic!("node_modules must be a symlink in the worktree: {e}"));
+    assert_eq!(
+        std::fs::canonicalize(&target).unwrap(),
+        expected_target,
+        "symlink points at the main checkout's node_modules"
+    );
+    assert!(
+        link.join("left-pad").join("package.json").is_file(),
+        "the symlinked node_modules is usable from inside the worktree"
+    );
+
+    // A second worktree peer shares the same warm cache path.
+    let second = create_assignment(&mut mcp, worktree_create(&head, &["src/ui/**"], &[]));
+    let dispatched = dispatch_worktree(&mut mcp, &second);
+    assert!(dispatched.get("error").is_none(), "{dispatched}");
+    assert_eq!(
+        dispatched["result"]["lease"]["cargoTargetDir"], json!(cargo_dir),
+        "worktree peers share one CARGO_TARGET_DIR"
+    );
+}
