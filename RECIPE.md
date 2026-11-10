@@ -11,7 +11,7 @@ Left to right, building on Herdr's default `main` layout:
 - **Sidebar** (268px): Herdr's brand bar (`workspace-chrome`), `spaces`, `agents`, and footer.
 - **Center Work Column**:
   - Top tab bar (`tabs`, 42px).
-  - Center stage (`main-stack`): toggles seamlessly between Herdr's active terminal tabs (`{ "tab": "active" }`) and the **Hotpot Session Inspector** (`hotpot-session`), which renders collapsible **💭 Thinking** blocks, **🔧 Tool Calls** (`input` / `output`), **📩 Mailbox** envelopes, and a live prompt box for the selected `Supervisor`, `Lead`, or `Peer`.
+  - Center stage (`main-stack`): toggles seamlessly between Herdr's active terminal tabs (`{ "tab": "active" }`) and the **Hotpot Session Inspector** (`hotpot-session`), which renders **💭 Thinking** blocks (expanded while the seat's turn is active, collapsible), **🔧 Tool Calls** (`input` / `output`), **📩 Attention / Assignment Notices**, and a live prompt box for the selected `Supervisor`, `Lead`, or `Peer`.
 - **Right Dock — Hotpot Panel** (`hotpot`, 360px default, resizable 280–600px, radius 10, `chrome` background):
   - **Seats**: Live cards for `Supervisor` and `Lead` showing provider/model lane, status dot (`working`, `blocked`, `done`, `idle`), and context-window occupancy (`64k / 128k`).
   - **Tasks & Peers**: Active SLP waves and Tasks (`T-01`, `T-02`, ...), their disposition (`engineer`, `scout`, `architect`, `reviewer`), Attempt counter (`1/3`), Gate Verdict pill (`GREEN` / `RED` / `RUNNING`), and live activity snippet (`💭 Thinking...` or `🔧 cargo test`).
