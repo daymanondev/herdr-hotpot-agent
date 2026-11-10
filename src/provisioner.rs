@@ -266,7 +266,7 @@ fn temp_sibling(path: &Path) -> PathBuf {
 /// Writes `contents` to `path` atomically: a temporary sibling is written first and then
 /// renamed over the destination, so a `Seat` never observes a half-written file. Any
 /// leftover temporary is removed on failure.
-fn atomic_write_file(path: &Path, contents: &str) -> Result<(), PlanError> {
+pub(crate) fn atomic_write_file(path: &Path, contents: &str) -> Result<(), PlanError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| PlanError::new("io", format!("failed to create parent of {}: {e}", path.display())))?;
@@ -512,6 +512,7 @@ pub fn base_home_plan(
     operator_home: &Path,
 ) -> Result<Plan, PlanError> {
     let codex_catalog = hygiene::scrubbed_catalog_contents(&hygiene::operator_codex_catalog()?);
+    let pi_models = role_homes::operator_pi_models_contents(operator_home)?;
     let mut items: Vec<PlanItem> = Vec::new();
     for agent in AGENTS {
         for role in ROLES {
@@ -523,6 +524,7 @@ pub fn base_home_plan(
                 role,
                 contracts.for_role(role),
                 &codex_catalog,
+                pi_models.as_deref(),
             ));
         }
     }
@@ -549,9 +551,17 @@ pub fn base_home_plan(
             value: "true".to_string(),
         });
     }
+    let mut notes = skill_projection.collision_notes;
+    if pi_models.is_none() {
+        notes.push(format!(
+            "note: no operator Pi models.json at {}; Pi Role Homes are provisioned without a \
+             models config (ZCode-via-pi routing stays inactive until one exists)",
+            operator_home.join(".pi").join("agent").join("models.json").display()
+        ));
+    }
     Ok(Plan {
         home: home.to_path_buf(),
         items,
-        notes: skill_projection.collision_notes,
+        notes,
     })
 }

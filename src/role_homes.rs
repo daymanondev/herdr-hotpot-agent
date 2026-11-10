@@ -8,8 +8,10 @@
 //! paths — never symlinks into the operator's homes.
 
 use crate::hygiene;
+use crate::provisioner::PlanError;
 use crate::provisioner::PlanItem;
 use serde_json::{Value, json};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The Role Home directory of one seat under Hotpot Home.
@@ -52,9 +54,34 @@ fn merge_objects(base: &mut Value, overlay: &Value) {
     }
 }
 
+/// The operator's Pi models config (`~/.pi/agent/models.json`, a read-only input) as the
+/// file contents projected verbatim into every Pi Role Home — the channel through which
+/// ZCode/GLM coding plans ride (a `zcode` provider at `127.0.0.1:8080` served by
+/// TriDefender/zcode-api; ADR 0004). Absent → `None` (no projection, setup reports a note);
+/// unparseable → fail closed (no projection can be produced).
+pub fn operator_pi_models_contents(operator_home: &Path) -> Result<Option<String>, PlanError> {
+    let path = operator_home.join(".pi").join("agent").join("models.json");
+    match fs::read_to_string(&path) {
+        Err(_) => Ok(None),
+        Ok(text) => {
+            let value: Value = serde_json::from_str(&text).map_err(|e| {
+                PlanError::new(
+                    "pi-models-projection",
+                    format!(
+                        "operator Pi models config {} is not valid JSON, so no projection into \
+                         Pi Role Homes can be produced: {e}",
+                        path.display()
+                    ),
+                )
+            })?;
+            Ok(Some(json_file_contents(&value)))
+        }
+    }
+}
+
 /// The seat's own credential file path (created by `hotpot auth login` / the vendor — never
 /// planned as a symlink to operator credential files).
-fn seat_credentials_file(role_home: &Path, agent: &str) -> PathBuf {
+pub(crate) fn seat_credentials_file(role_home: &Path, agent: &str) -> PathBuf {
     match agent {
         // Vendor-native names: codex stores `auth.json`, claude `.credentials.json`.
         "claude" => role_home.join(".credentials.json"),
@@ -74,7 +101,8 @@ fn seat_session_history_file(role_home: &Path, agent: &str) -> PathBuf {
 /// server, the agent's additive instruction artifacts, and the Capability Hygiene closures
 /// (see [`hygiene`]). The same rendered `contract` is delivered to every agent family for a
 /// given role; `codex_catalog` is the already-scrubbed model catalog projected into Codex
-/// seats (ignored by the other families).
+/// seats and `pi_models` the operator Pi models config projected into Pi seats (each ignored
+/// by the other families; `None` projects no Pi models file at all).
 pub fn seat_plan_items(
     home: &Path,
     hotpot_bin: &Path,
@@ -82,6 +110,7 @@ pub fn seat_plan_items(
     role: &str,
     contract: &str,
     codex_catalog: &str,
+    pi_models: Option<&str>,
 ) -> Vec<PlanItem> {
     let role_home = role_home_dir(home, agent, role);
     let mcp = hotpot_mcp_server(hotpot_bin, home, agent, role);
@@ -148,7 +177,9 @@ pub fn seat_plan_items(
         }
         // Pi: `settings.json` carries the MCP wiring and seat declarations;
         // `APPEND_SYSTEM.md` is the additive system-prompt append file; `launch.json`
-        // records the closed extension launch args.
+        // records the closed extension launch args; the operator's models config (when it
+        // exists) is projected verbatim as `models.json` so local providers such as
+        // TriDefender/zcode-api at 127.0.0.1:8080 reach the seat.
         "pi" => {
             let settings = json!({
                 "mcpServers": { "hotpot": mcp },
@@ -156,7 +187,7 @@ pub fn seat_plan_items(
                 "credentials_file": credentials_file,
                 "session_history_file": session_history_file,
             });
-            vec![
+            let mut items = vec![
                 PlanItem::File {
                     path: path("launch.json"),
                     contents: hygiene::pi_launch_config_contents(),
@@ -169,7 +200,14 @@ pub fn seat_plan_items(
                     path: path("APPEND_SYSTEM.md"),
                     contents: contract.to_string(),
                 },
-            ]
+            ];
+            if let Some(models) = pi_models {
+                items.push(PlanItem::File {
+                    path: path("models.json"),
+                    contents: models.to_string(),
+                });
+            }
+            items
         }
         other => unreachable!("seat_plan_items called for unknown agent {other}"),
     }
