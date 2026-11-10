@@ -1,15 +1,19 @@
+pub mod contracts;
 pub mod guard;
 pub mod hc;
 pub mod inspector;
 pub mod provisioner;
+pub mod role_homes;
 pub mod runtime;
 pub mod slp;
 
+use contracts::RenderedContracts;
 use guard::{Role, evaluate_pre_tool_hook};
 use inspector::{SessionInspection, TranscriptItem};
 use provisioner::{
     PlanError, RUNTIME_STATE_DIR, base_home_plan, find_on_path, find_role_credential_files,
-    guard_removal_root, removal_paths, resolve_hotpot_home, runtime_state_active,
+    guard_removal_root, removal_paths, resolve_hotpot_home, runtime_opt_in_from_env,
+    runtime_state_active,
 };
 use serde_json::Value;
 use slp::{HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus};
@@ -269,12 +273,24 @@ fn cmd_mcp(args: &[String]) {
 }
 
 /// `hotpot setup [--apply]`: dry-run desired-state planning over Hotpot Home by default;
-/// `--apply` materializes exactly the planned set.
+/// `--apply` materializes exactly the planned set (nine Role Homes with their vendor configs,
+/// additive role contracts, `AUTHENTICATION.md`, and the `hotpot.json` marker).
 fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
     let apply = args.iter().any(|a| a == "--apply");
     let home = resolve_hotpot_home()?;
+    let contracts = RenderedContracts::from_env();
+    let runtime_opt_in = runtime_opt_in_from_env();
+    let hotpot_bin = env::current_exe().map_err(|e| {
+        PlanError::new("io", format!("failed to resolve the running hotpot binary: {e}"))
+    })?;
     let hc_available = find_on_path("hc").is_some();
-    let plan = base_home_plan(&home, hc_available);
+    let plan = base_home_plan(
+        &home,
+        &hotpot_bin,
+        &contracts,
+        runtime_opt_in,
+        hc_available,
+    );
     plan.validate()?;
 
     let stdout = io::stdout();
