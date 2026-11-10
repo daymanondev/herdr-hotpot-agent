@@ -95,6 +95,27 @@ fn base_plan_items() -> BTreeMap<String, &'static str> {
     items
 }
 
+/// The credential-seeding plan items expected over a fake operator home whose three
+/// credential sentinels exist (ticket 02): one independent credential copy plus one shape
+/// sidecar per seat — the operator home stays a read-only input.
+fn seeded_plan_items() -> BTreeMap<String, &'static str> {
+    let mut items = BTreeMap::new();
+    for agent in ["codex", "claude", "pi"] {
+        let credential = match agent {
+            "claude" => ".credentials.json",
+            _ => "auth.json",
+        };
+        for role in ["supervisor", "lead", "peer"] {
+            items.insert(format!("roles/{agent}/{role}/{credential}"), "file");
+            items.insert(
+                format!("roles/{agent}/{role}/credentials.preserved.json"),
+                "file",
+            );
+        }
+    }
+    items
+}
+
 /// Minimal PATH so the real operator environment (a possibly installed real `hc`) can never
 /// leak into these tests; the fake `hc` bin dir is prepended when the test wants one.
 fn sandbox_path(fake_bin: Option<&Path>) -> String {
@@ -210,8 +231,11 @@ fn setup_dry_run_prints_every_planned_path_and_mutates_nothing() {
         stderr_of(&out)
     );
     let stdout = stdout_of(&out);
-    for (rel, kind) in base_plan_items() {
-        let abs = home.path().join(&rel);
+    let mut expected_items = base_plan_items();
+    let seeding = seeded_plan_items();
+    expected_items.extend(seeding);
+    for (rel, kind) in &expected_items {
+        let abs = home.path().join(rel);
         assert!(
             stdout.contains(&format!("plan: {kind} {}", abs.display())),
             "dry-run stdout must print planned {kind} {rel}:\n{stdout}"
@@ -223,8 +247,9 @@ fn setup_dry_run_prints_every_planned_path_and_mutates_nothing() {
         .count();
     assert_eq!(
         plan_line_count,
-        base_plan_items().len(),
-        "dry-run must print exactly the base plan items, no more:\n{stdout}"
+        expected_items.len(),
+        "dry-run must print exactly the base plan items plus the credential seeding items \
+         the planted operator sentinels make eligible, no more:\n{stdout}"
     );
     assert!(
         stdout.to_lowercase().contains("dry-run"),

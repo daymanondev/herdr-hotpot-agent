@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod contracts;
+pub mod credential_seeding;
 pub mod guard;
 pub mod hc;
 pub mod hygiene;

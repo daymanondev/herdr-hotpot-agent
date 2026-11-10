@@ -511,7 +511,9 @@ pub fn guard_removal_root(home: &Path) -> Result<(), PlanError> {
 /// Home wirings, the Peer hygiene projections, and the `skill-projections/manifest.json`
 /// fence source) are generated from the read-only operator skill roots under
 /// `operator_home` (`~/.codex/skills`, `~/.claude/skills`, `~/.pi/agent/skills`); collision
-/// exclusions ride along as plan notes. `runtime/` is never part of a plan (preserve-only);
+/// exclusions ride along as plan notes. Existing operator credentials are seeded as
+/// independent copies into every Role Home that lacks its own
+/// ([`credential_seeding::seed_plan_items`]). `runtime/` is never planned (preserve-only);
 /// `hc` profile changes are only planned when `hc` is discoverable on `PATH`. Fails closed
 /// when the operator's Codex model catalog cannot be produced scrubbed
 /// ([`hygiene::operator_codex_catalog`]).
@@ -537,6 +539,9 @@ pub fn base_home_plan(
                 contracts.for_role(role),
                 &codex_catalog,
                 pi_models.as_deref(),
+            ));
+            items.extend(crate::credential_seeding::seed_plan_items(
+                home, operator_home, agent, role,
             ));
         }
     }
