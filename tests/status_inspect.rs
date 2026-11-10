@@ -260,6 +260,13 @@ fn status_projects_seats_assignments_mailbox_and_attention_from_the_fixture() {
 
     assert_eq!(status["project"], json!(slug), "project slug is canonical");
     assert_eq!(status["workspace"], json!(repo_path));
+    // The watch target the mods subscribe to with `watchFolder`: the runtime
+    // root under Hotpot Home, now that seeded runtime state exists.
+    assert_eq!(
+        status["runtimeDir"],
+        json!(home.path().join("runtime").join("v1").to_string_lossy().into_owned()),
+        "runtimeDir names <HOTPOT_HOME>/runtime/v1 for the mods' watchFolder"
+    );
     assert_eq!(
         status["seats"].as_array().unwrap().len(),
         3,
@@ -372,6 +379,51 @@ fn status_projects_seats_assignments_mailbox_and_attention_from_the_fixture() {
 }
 
 // ---------------------------------------------------------------------------
+// CLI dispatch — unknown subcommands fail closed; bare `hotpot` means status
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unknown_subcommand_fails_closed_while_bare_hotpot_answers_status() {
+    let home = TempDir::new("home");
+    let workspace = TempDir::new("ws");
+
+    // A typo must not silently answer with the status JSON and exit 0.
+    let out = run_hotpot(home.path(), &["setu"], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unknown subcommand exits 2, not 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown command") && stderr.contains("setu") && stderr.contains("--help"),
+        "stderr names the unknown command and points at help: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "no status JSON leaks to stdout for an unknown subcommand"
+    );
+
+    // A bare `hotpot` (no arguments) keeps its documented meaning: `status`.
+    let out = Command::new(env!("CARGO_BIN_EXE_hotpot"))
+        .env("HOTPOT_HOME", home.path())
+        .env("HOTPOT_NOW", NOW.to_string())
+        .env("HOTPOT_HC", home.path().join("missing-hc").to_string_lossy().into_owned())
+        .current_dir(workspace.path())
+        .output()
+        .expect("spawn bare hotpot");
+    assert!(
+        out.status.success(),
+        "bare hotpot exits 0 as status: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("bare hotpot stdout is status JSON: {e}"));
+    assert_eq!(status["seats"], json!([]), "bare hotpot serves the status projection");
+}
+
+// ---------------------------------------------------------------------------
 // Acceptance criterion 2 — empty state stays empty (no mocked values)
 // ---------------------------------------------------------------------------
 
@@ -398,6 +450,9 @@ fn status_on_an_empty_home_exits_zero_with_empty_arrays() {
     assert_eq!(status["tasks"], json!([]));
     assert_eq!(status["mailbox"], json!([]));
     assert_eq!(status["attention"], json!([]));
+    // No runtime state on disk yet: no watch target either — the mods keep
+    // their timer fallback instead of subscribing to a missing directory.
+    assert_eq!(status["runtimeDir"], Value::Null, "runtimeDir stays null on an empty home");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     for mock in [
         "seat-supervisor",

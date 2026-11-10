@@ -626,14 +626,20 @@ fn cmd_seat(args: &[String]) {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let sub = args.get(1).map(String::as_str).unwrap_or("status");
+    // A bare `hotpot` means `hotpot status`; `rest` is the subcommand's own
+    // argv (empty for the bare form — `args[2..]` would panic on a 1-element
+    // argv, which is exactly what the bare form has).
+    let (sub, rest): (&str, &[String]) = match args.get(1) {
+        Some(sub) => (sub.as_str(), &args[2..]),
+        None => ("status", &[]),
+    };
     match sub {
-        "status" => cmd_status(&args[2..]),
-        "inspect" => cmd_inspect(&args[2..]),
-        "hook" => cmd_hook(&args[2..]),
-        "mcp" => cmd_mcp(&args[2..]),
+        "status" => cmd_status(rest),
+        "inspect" => cmd_inspect(rest),
+        "hook" => cmd_hook(rest),
+        "mcp" => cmd_mcp(rest),
         "setup" => {
-            if let Err(err) = cmd_setup(&args[2..]) {
+            if let Err(err) = cmd_setup(rest) {
                 eprintln!("hotpot: {err}");
                 std::process::exit(1);
             }
@@ -645,16 +651,16 @@ fn main() {
             }
         }
         "remove" => {
-            if let Err(err) = cmd_remove(&args[2..]) {
+            if let Err(err) = cmd_remove(rest) {
                 eprintln!("hotpot: {err}");
                 std::process::exit(1);
             }
         }
-        "auth" => cmd_auth(&args[2..]),
-        "profile" => cmd_profile(&args[2..]),
-        "seat" => cmd_seat(&args[2..]),
-        "export" => cmd_export(&args[2..]),
-        "gate-runner" => cmd_gate_runner(&args[2..]),
+        "auth" => cmd_auth(rest),
+        "profile" => cmd_profile(rest),
+        "seat" => cmd_seat(rest),
+        "export" => cmd_export(rest),
+        "gate-runner" => cmd_gate_runner(rest),
         "--help" | "-h" | "help" => {
             println!("hotpot 0.1.0 — Rust SLP verification engine & session inspector for Herdr");
             println!("Commands: status, inspect, hook, mcp, setup [--apply], verify, remove [--apply],");
@@ -663,6 +669,13 @@ fn main() {
             println!("           seat launch <supervisor|lead|peer> --agent <codex|claude|pi> --project <path>,");
             println!("           export <project> --out <path>");
         }
-        _ => cmd_status(&args[1..]),
+        // Fail closed like every other subcommand: an unknown name (a typo such
+        // as `hotpot setu`) must not silently answer with the status JSON and
+        // exit 0. A bare `hotpot` still means `hotpot status` through the
+        // `None => ("status", &[])` arm above.
+        _ => {
+            eprintln!("hotpot: unknown command `{sub}` — try `hotpot --help`");
+            std::process::exit(2);
+        }
     }
 }

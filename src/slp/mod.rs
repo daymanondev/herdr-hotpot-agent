@@ -120,6 +120,14 @@ pub struct HotpotStatusSnapshot {
     pub project: String,
     pub workspace: String,
     pub mode: String,
+    /// The runtime directory under Hotpot Home this projection read
+    /// (`<HOTPOT_HOME>/runtime/v1`), when it exists — the path the Herdr mods
+    /// subscribe to with `watchFolder` for event-driven refreshes (spec
+    /// "Implementation Decisions → Single Native Binary + Two GPUI Mods";
+    /// ADR 0001). `None` while no runtime state exists yet, so a mod never
+    /// subscribes to a missing directory and keeps its timer fallback.
+    #[serde(rename = "runtimeDir")]
+    pub runtime_dir: Option<String>,
     #[serde(rename = "generatedAt")]
     pub generated_at: u64,
     pub seats: Vec<SeatStatus>,

@@ -69,12 +69,8 @@ pub fn snapshot(
     terminals: &[HcTerminalSummary],
     now: u64,
 ) -> HotpotStatusSnapshot {
-    let ledger = Ledger::at(
-        home.join("runtime")
-            .join("v1")
-            .join(slug)
-            .join("ledger.jsonl"),
-    );
+    let runtime_root = home.join("runtime").join("v1");
+    let ledger = Ledger::at(runtime_root.join(slug).join("ledger.jsonl"));
     let events = ledger.read_events();
     let state = RuntimeState::from_events(&events);
     let profiles = read_profiles(home);
@@ -93,6 +89,12 @@ pub fn snapshot(
         project: slug.to_string(),
         workspace: workspace.to_string(),
         mode: "slp".to_string(),
+        // The watch target handed to the mods' `watchFolder`; absent until any
+        // runtime state exists, so a mod keeps its timer fallback instead of
+        // subscribing to a directory that is not there.
+        runtime_dir: runtime_root
+            .is_dir()
+            .then(|| runtime_root.display().to_string()),
         generated_at: now,
         seats: project_seats(&events, &state, terminals, slug, &profiles),
         tasks: project_tasks(&events, &state, terminals),
