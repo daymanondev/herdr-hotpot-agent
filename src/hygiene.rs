@@ -475,13 +475,33 @@ fn check_pi_launch_args(home: &Path, role: &str, mode: CheckMode) -> Vec<CheckRe
     }
 }
 
+/// The default bound on the offline `pi` RPC probe: real `pi` builds answer immediately
+/// after stdin closes, so a probe still running past this is a build that ignores stdin
+/// EOF — one that would otherwise hang `hotpot verify` (and `check.sh`) indefinitely.
+const DEFAULT_PI_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The probe bound, overridable through `HOTPOT_PI_PROBE_TIMEOUT_MS` (a positive
+/// millisecond count) so tests can pin it low and operators on very slow machines can
+/// widen it.
+fn pi_probe_timeout() -> std::time::Duration {
+    env::var("HOTPOT_PI_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(DEFAULT_PI_PROBE_TIMEOUT, std::time::Duration::from_millis)
+}
+
 /// `pi-mcp-probe`: launches the `pi` binary found on `PATH` with the closed launch args in
 /// offline RPC mode (`--offline --mode rpc`, feeding `{"type":"get_commands"}` on stdin and
-/// closing stdin immediately so neither real `pi` nor a fake test shim can block) and asserts
-/// `/mcp` resolves strictly to `builtin:mcp`.
+/// closing stdin immediately), waits for it to answer under a bounded timeout (a `pi` that
+/// ignores stdin EOF is killed instead of hanging verify), and asserts `/mcp` resolves
+/// strictly to `builtin:mcp`. Real `pi` builds may print banner lines before the RPC
+/// report, so every stdout line is parsed and the first JSON object carrying probe data
+/// (`extensions` or `data`) wins — a banner never breaks the probe.
 fn check_pi_mcp_probe(role: &str) -> CheckResult {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::process::Stdio;
+    use std::time::{Duration, Instant};
 
     let seat = format!("roles/pi/{role}");
     let Some(pi) = find_on_path("pi") else {
@@ -509,37 +529,91 @@ fn check_pi_mcp_probe(role: &str) -> CheckResult {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(b"{\"type\":\"get_commands\"}\n");
     }
-    let Ok(output) = child.wait_with_output() else {
-        return CheckResult::fail(
-            CHECK_PI_PROBE,
-            format!("failed to run the pi RPC probe for {seat}"),
-        );
+    // Dropping the taken stdin above closes it; drain stdout and stderr off-thread so a
+    // chatty `pi` can never block on full pipes while the exit is polled below.
+    let stdout_reader = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = pipe.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = pipe.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let timeout = pi_probe_timeout();
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                return CheckResult::fail(
+                    CHECK_PI_PROBE,
+                    format!("failed to run the pi RPC probe for {seat}"),
+                );
+            }
+        }
     };
-    if !output.status.success() {
+    let Some(status) = status else {
+        // The probe is bounded, but the killed `pi`'s orphaned children (a shell shim's
+        // `sleep`, say) can still hold the output pipes: never join the drain threads on
+        // this path. The timeout is the answer; the detached drains die with the process.
         return CheckResult::fail(
             CHECK_PI_PROBE,
             format!(
-                "pi RPC probe for {seat} exited with {}",
-                output.status.code().unwrap_or(-1)
+                "pi RPC probe for {seat} timed out after {}ms (the pi binary ignored stdin \
+                 EOF); killed",
+                timeout.as_millis()
             ),
         );
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let first_line = stdout
-        .lines()
-        .find(|l| !l.trim().is_empty())
+    let stderr = stderr_reader
+        .and_then(|reader| reader.join().ok())
         .unwrap_or_default();
-    let report: Value = match serde_json::from_str(first_line.trim()) {
-        Ok(value) => value,
-        Err(_) => {
-            return CheckResult::fail(
-                CHECK_PI_PROBE,
+    if !status.success() {
+        let stderr = stderr.trim();
+        return CheckResult::fail(
+            CHECK_PI_PROBE,
+            if stderr.is_empty() {
+                format!("pi RPC probe for {seat} exited with {}", status.code().unwrap_or(-1))
+            } else {
                 format!(
-                    "pi RPC probe for {seat} returned unparseable output: {}",
-                    stdout.trim()
-                ),
-            );
-        }
+                    "pi RPC probe for {seat} exited with {}: {stderr}",
+                    status.code().unwrap_or(-1)
+                )
+            },
+        );
+    }
+    let stdout = stdout_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let parsed: Vec<Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .collect();
+    let report = parsed
+        .iter()
+        .find(|value| value.get("extensions").is_some() || value.get("data").is_some())
+        .or_else(|| parsed.first())
+        .cloned();
+    let Some(report) = report else {
+        return CheckResult::fail(
+            CHECK_PI_PROBE,
+            format!(
+                "pi RPC probe for {seat} returned unparseable output: {}",
+                stdout.trim()
+            ),
+        );
     };
     let extensions = string_array(&report, "extensions").unwrap_or_else(|| {
         report["data"]["commands"]

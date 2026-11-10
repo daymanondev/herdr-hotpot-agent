@@ -615,6 +615,90 @@ fn pi_probe_resolving_mcp_to_an_extra_extension_fails_verify() {
     );
 }
 
+/// A fake `pi` that prints a banner line before its single-line RPC report — the shape
+/// real `pi` builds emit on stdout; the probe must find the report past the banner.
+fn write_banner_pi(bin_dir: &Path, extensions: &[&str]) {
+    fs::create_dir_all(bin_dir).unwrap();
+    let list = extensions
+        .iter()
+        .map(|e| format!("\"{e}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf 'pi 9.2.1 (offline build, no telemetry)\\n'\n\
+         printf '{{\"path\":\"/mcp\",\"extensions\":[{list}]}}\\n'\n\
+         exit 0\n"
+    );
+    let shim = bin_dir.join("pi");
+    fs::write(&shim, script).unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn pi_probe_finds_the_report_past_banner_lines() {
+    let home = TempDir::new("probe-banner");
+    let fake_home = TempDir::new("probe-banner-op");
+    plant_operator_codex_catalog(fake_home.path());
+    let bin = TempDir::new("probe-banner-bin");
+    write_banner_pi(bin.path(), &["builtin:mcp"]);
+    apply_clean(home.path(), fake_home.path(), Some(bin.path()));
+
+    let out = run_hotpot(home.path(), fake_home.path(), Some(bin.path()), &["verify"]);
+    assert!(
+        out.status.success(),
+        "a pi printing a banner before its RPC report must still verify green\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    for role in ROLES {
+        assert!(
+            stdout.contains(&format!("ok pi-mcp-probe roles/pi/{role}")),
+            "the banner line must not break the probe's JSON parsing:\n{stdout}"
+        );
+    }
+}
+
+/// A fake `pi` that ignores stdin EOF entirely (it sleeps instead of answering): the
+/// probe must kill it at the (test-pinned) bound and fail verify naming the timeout —
+/// never hang it.
+#[test]
+fn pi_probe_kills_a_pi_that_ignores_stdin_eof_instead_of_hanging() {
+    let home = TempDir::new("probe-hang");
+    let fake_home = TempDir::new("probe-hang-op");
+    plant_operator_codex_catalog(fake_home.path());
+    let bin = TempDir::new("probe-hang-bin");
+    fs::create_dir_all(bin.path()).unwrap();
+    let shim = bin.path().join("pi");
+    fs::write(&shim, "#!/bin/sh\nsleep 30\n").unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    apply_clean(home.path(), fake_home.path(), Some(bin.path()));
+
+    let started = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_hotpot"))
+        .arg("verify")
+        .env("HOTPOT_HOME", home.path())
+        .env("HOME", fake_home.path())
+        .env("PATH", sandbox_path(Some(bin.path())))
+        .env("HOTPOT_PI_PROBE_TIMEOUT_MS", "250")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "verify must exit non-zero when the pi probe never answers"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "verify must bound the probe (took {}s)", started.elapsed().as_secs()
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("pi-mcp-probe") && stderr.contains("timed out"),
+        "the probe failure must name the check and the timeout:\n{stderr}"
+    );
+}
+
 #[test]
 fn verify_fails_closed_when_pi_is_unavailable_for_the_probe() {
     let home = TempDir::new("nopi");
