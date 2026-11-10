@@ -8,6 +8,8 @@
 //! Event types written by this slice (`assignment` = assignment id):
 //! - `assignment_created`    { assignment, outcome, disposition, baseCommit, writeScope, serialOnly, gate, thinking?, thinkingReason? }
 //! - `assignment_dispatched` { assignment, correlation, workspace }
+//! - `writer_lease_acquired` { assignment, mode, worktree?, cargoTargetDir?, worktreeInclude? }
+//! - `writer_lease_released` { assignment, worktreeAction }
 //! - `assignment_asked`      { assignment, question }          (written by the peer `ask` path)
 //! - `assignment_answered`   { assignment, answer }
 //! - `assignment_handed_back`{ assignment, summary }           (written by the peer `handoff` path)

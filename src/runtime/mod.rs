@@ -3,13 +3,17 @@
 //!
 //! This slice delivers the exact per-role tool surface, the Lead `Assignment`
 //! lifecycle (`Draft -> Dispatched -> Asking | HandedBack | Stopped`; terminal
-//! states -> `Closed`), verified `baseCommit`, and the `thinking` effort refusal.
-//! Writer leases/worktrees, peer `ask`/`handoff` semantics, detached gate
-//! execution, and supervisor tool semantics land with their own runtime slices.
+//! states -> `Closed`), verified `baseCommit`, the `thinking` effort refusal, and
+//! Writer Leases for writable assignments (exclusive in-checkout after clean-HEAD
+//! verification; isolated worktrees land with the worktree slice). Peer
+//! `ask`/`handoff` semantics, detached gate execution, and supervisor tool
+//! semantics land with their own runtime slices.
 
 pub mod ledger;
+pub mod leases;
 
 pub use ledger::{Ledger, project_slug, sha1_hex};
+pub use leases::{IN_CHECKOUT_EXCLUSIVE, WriterLease};
 
 use crate::guard::Role;
 use serde_json::{Value, json};
@@ -282,9 +286,10 @@ fn call_tool(
         "assignment_accept" => assignment_accept(ledger, args),
         "assignment_close" => assignment_close(ledger, args),
         "gate_run" => gate_run(ledger, args),
-        "workspace_close" | "lease_reclaim" => Err(RpcError::not_implemented(format!(
-            "`{tool}` is listed for role `lead` but its semantics land with the writer-lease manager slice"
-        ))),
+        "workspace_close" => workspace_close(ledger, project_root, args),
+        "lease_reclaim" => Err(RpcError::not_implemented(
+            "`lease_reclaim` semantics land with the stale-lease reclaim slice",
+        )),
         "ask" | "handoff" => Err(RpcError::not_implemented(format!(
             "`{tool}` semantics land with the peer identity slice; the correlation -> assignment binding is registered at assignment_dispatch"
         ))),
@@ -356,10 +361,12 @@ impl Assignment {
     }
 }
 
-/// All assignments of one project ledger, rebuilt by replaying the event log.
+/// All assignments and active Writer Leases of one project ledger, rebuilt by
+/// replaying the event log.
 #[derive(Debug, Default)]
 pub struct RuntimeState {
     assignments: std::collections::BTreeMap<String, Assignment>,
+    leases: std::collections::BTreeMap<String, WriterLease>,
 }
 
 impl RuntimeState {
@@ -373,6 +380,16 @@ impl RuntimeState {
 
     pub fn assignment(&self, id: &str) -> Option<&Assignment> {
         self.assignments.get(id)
+    }
+
+    /// The active Writer Lease held for `assignment`, if any.
+    pub fn lease_for(&self, assignment: &str) -> Option<&WriterLease> {
+        self.leases.get(assignment)
+    }
+
+    /// Every currently held Writer Lease (release order = acquisition order).
+    pub fn active_leases(&self) -> Vec<&WriterLease> {
+        self.leases.values().collect()
     }
 
     fn apply(&mut self, event: &Value) {
@@ -403,6 +420,21 @@ impl RuntimeState {
                         workspace: None,
                     },
                 );
+            }
+            "writer_lease_acquired" => {
+                self.leases.insert(
+                    id.to_string(),
+                    WriterLease {
+                        assignment: id.to_string(),
+                        mode: str_field(event, "mode"),
+                        worktree: opt_str_field(event, "worktree"),
+                        cargo_target_dir: opt_str_field(event, "cargoTargetDir"),
+                        worktree_include: str_array_field(event, "worktreeInclude"),
+                    },
+                );
+            }
+            "writer_lease_released" | "writer_lease_reclaimed" => {
+                self.leases.remove(id);
             }
             "assignment_dispatched" => {
                 if let Some(a) = self.assignments.get_mut(id) {
@@ -701,6 +733,22 @@ fn assignment_dispatch(
     let asg = require_assignment(ledger, TOOL, &id)?;
     require_state(TOOL, "dispatch", &asg, &["Draft"])?;
 
+    // Writability is declared by a non-empty Write Scope: read-only assignments
+    // (e.g. a Reviewer) acquire no Writer Lease and never touch the checkout.
+    let writable = !asg.write_scope.is_empty();
+    let state = RuntimeState::load(ledger);
+    if writable {
+        // The exclusive checkout lease blocks writes from all other seats —
+        // including Lead itself — until it is released (spec user story 20).
+        if let Some(holder) = state.active_leases().first() {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: writer_exclusive: the checkout writer lease is held by `{}` (mode `{}`); writable dispatch is refused for all seats (including Lead) until the lease is released",
+                holder.assignment, holder.mode
+            )));
+        }
+        leases::verify_checkout_preconditions(project_root, &asg.base_commit)?;
+    }
+
     // The correlation -> (project, assignment, workspace) binding is what the peer
     // identity slice resolves server-side; peers never supply their own ids.
     let ordinal = ledger
@@ -727,16 +775,73 @@ fn assignment_dispatch(
                 .to_string()
         });
 
-    append_and_reload(
-        ledger,
-        TOOL,
-        json!({
+    ledger
+        .append(json!({
             "type": "assignment_dispatched",
             "assignment": id,
             "correlation": correlation,
             "workspace": workspace,
-        }),
-    )
+        }))
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    if writable {
+        ledger
+            .append(leases::lease_acquired_event(
+                &id,
+                leases::IN_CHECKOUT_EXCLUSIVE,
+                None,
+                None,
+                &[],
+            ))
+            .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    }
+
+    let state = RuntimeState::load(ledger);
+    let mut result = state
+        .assignment(&id)
+        .expect("assignment exists before its lifecycle event")
+        .to_json();
+    if let Some(lease) = state.lease_for(&id) {
+        result["lease"] = json!({
+            "mode": lease.mode,
+            "worktree": lease.worktree,
+            "cargoTargetDir": lease.cargo_target_dir,
+            "worktreeInclude": lease.worktree_include,
+        });
+    }
+    Ok(result)
+}
+
+/// `workspace_close`: release the assignment's Writer Lease and clean/retain its
+/// isolated worktree per assignment state (spec user story 20-22).
+fn workspace_close(
+    ledger: &Ledger,
+    project_root: &Path,
+    args: &Value,
+) -> Result<Value, RpcError> {
+    const TOOL: &str = "workspace_close";
+    let _ = project_root; // worktree clean/retain lands with the isolated worktree slice
+    let id = arg_str(args, TOOL, "assignment")?;
+    require_assignment(ledger, TOOL, &id)?;
+    if RuntimeState::load(ledger).lease_for(&id).is_none() {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: no active writer lease for `{id}`; workspace_close releases a lease held by a dispatched assignment"
+        )));
+    }
+
+    ledger
+        .append(json!({
+            "type": "writer_lease_released",
+            "assignment": id,
+            "worktreeAction": "none",
+        }))
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    let state = RuntimeState::load(ledger);
+    let mut result = state
+        .assignment(&id)
+        .expect("assignment exists before its lifecycle event")
+        .to_json();
+    result["lease"] = json!({"released": true, "worktreeAction": "none"});
+    Ok(result)
 }
 
 fn assignment_answer(ledger: &Ledger, args: &Value) -> Result<Value, RpcError> {
