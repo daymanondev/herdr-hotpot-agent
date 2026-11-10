@@ -7,7 +7,7 @@
 use crate::provisioner::{PlanError, find_on_path};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,20 +128,42 @@ pub fn run_terminal(args: &[String]) -> Result<(), PlanError> {
 /// Rewrites `hc run` argv carrying `--env K=V ... -- <vendor> ...` into
 /// `hc run ... -- env K=V ... <vendor> ...` for `herdr-core` binaries whose `hc run` does not
 /// take `--env` directly, and maps `--disallow-tool` to `--disallowedTools` for Claude Code.
+/// For a recognized vendor command, the Role Home scoping is translated into the vendor's
+/// canonical configuration variable (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`)
+/// while the `HOME=<role_home>` override is dropped, so the live terminal inherits the
+/// operator's real `HOME` (macOS Keychain access for Claude Code, local toolchains) instead
+/// of being jailed behind the Role Home path.
 fn rewrite_for_herdr_core(args: &[String]) -> Vec<String> {
     let sep = args.iter().position(|a| a == "--").unwrap_or(args.len());
     let (before, after) = (&args[..sep], &args[sep..]);
+    let vendor = after.get(1).map(String::as_str).and_then(vendor_home_var);
     let mut hc_flags = Vec::new();
     let mut env_pairs = Vec::new();
+    let mut role_home: Option<String> = None;
     let mut i = 0;
     while i < before.len() {
         if before[i] == "--env" && i + 1 < before.len() {
-            env_pairs.push(before[i + 1].clone());
+            let pair = &before[i + 1];
+            if vendor.is_some()
+                && let Some(value) = pair.strip_prefix("HOME=")
+            {
+                // Known vendor: drop the HOME override (the operator's real HOME must stay
+                // intact) and remember the Role Home for the vendor variable below.
+                role_home = Some(value.to_string());
+                i += 2;
+                continue;
+            }
+            env_pairs.push(pair.clone());
             i += 2;
         } else {
             hc_flags.push(before[i].clone());
             i += 1;
         }
+    }
+    if let (Some(var), Some(home)) = (vendor, role_home)
+        && !env_pairs.iter().any(|p| p.starts_with(var) && p[var.len()..].starts_with('='))
+    {
+        env_pairs.push(format!("{var}={home}"));
     }
     hc_flags.push("--".to_string());
     if !env_pairs.is_empty() {
@@ -158,6 +180,19 @@ fn rewrite_for_herdr_core(args: &[String]) -> Vec<String> {
     hc_flags
 }
 
+/// The vendor's canonical Role Home configuration variable, inferred from the vendor command
+/// binary name following `--` on the `hc run` argv. `None` for unrecognized vendors (their
+/// env pairs pass through the rewrite unchanged).
+fn vendor_home_var(command: &str) -> Option<&'static str> {
+    let name = Path::new(command).file_name()?.to_str()?;
+    match name {
+        "codex" => Some("CODEX_HOME"),
+        "claude" => Some("CLAUDE_CONFIG_DIR"),
+        "pi" => Some("PI_CODING_AGENT_DIR"),
+        _ => None,
+    }
+}
+
 /// Sends prompt text to a live `hc` terminal (`hc send <target> <message>`).
 pub fn send_terminal_prompt(target: &str, message: &str) -> Result<(), String> {
     let Some(hc) = hc_binary() else {
@@ -171,5 +206,135 @@ pub fn send_terminal_prompt(target: &str, message: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_for_herdr_core;
+
+    /// Table-driven argv fixtures for the real-`herdr-core` fallback rewrite (ticket 03):
+    /// every row pins the full rewritten argv so the vendor translation, the dropped `HOME`
+    /// override, and the untouched label/cwd/flag arguments are all part of the contract.
+    #[test]
+    fn rewrite_scopes_vendor_home_and_preserves_operator_home() {
+        let cases: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![(
+            "codex: vendor var kept, HOME override dropped",
+            vec![
+                "--bg",
+                "--keep",
+                "--cwd",
+                "/repo",
+                "--label",
+                "hotpot.v1=true",
+                "--label",
+                "hotpot.agent=codex",
+                "--env",
+                "HOME=/roles/codex/lead",
+                "--env",
+                "CODEX_HOME=/roles/codex/lead",
+                "--",
+                "/usr/local/bin/codex",
+            ],
+            vec![
+                "--bg",
+                "--keep",
+                "--cwd",
+                "/repo",
+                "--label",
+                "hotpot.v1=true",
+                "--label",
+                "hotpot.agent=codex",
+                "--",
+                "env",
+                "CODEX_HOME=/roles/codex/lead",
+                "/usr/local/bin/codex",
+            ],
+        ), (
+            "claude: vendor var kept, HOME dropped, deny flags mapped",
+            vec![
+                "--cwd",
+                "/repo",
+                "--label",
+                "hotpot.agent=claude",
+                "--env",
+                "HOME=/roles/claude/peer",
+                "--env",
+                "CLAUDE_CONFIG_DIR=/roles/claude/peer",
+                "--",
+                "/opt/claude",
+                "--disallow-tool",
+                "Task",
+            ],
+            vec![
+                "--cwd",
+                "/repo",
+                "--label",
+                "hotpot.agent=claude",
+                "--",
+                "env",
+                "CLAUDE_CONFIG_DIR=/roles/claude/peer",
+                "/opt/claude",
+                "--disallowedTools",
+                "Task",
+            ],
+        ), (
+            "pi: HOME translated into PI_CODING_AGENT_DIR",
+            vec![
+                "--cwd",
+                "/repo",
+                "--env",
+                "HOME=/roles/pi/peer",
+                "--",
+                "/usr/bin/pi",
+                "--no-extensions",
+            ],
+            vec![
+                "--cwd",
+                "/repo",
+                "--",
+                "env",
+                "PI_CODING_AGENT_DIR=/roles/pi/peer",
+                "/usr/bin/pi",
+                "--no-extensions",
+            ],
+        ), (
+            "unknown vendor: env pairs pass through unchanged, HOME kept",
+            vec![
+                "--cwd",
+                "/repo",
+                "--env",
+                "HOME=/roles/other/peer",
+                "--env",
+                "FOO=bar",
+                "--",
+                "/opt/bin/someagent",
+                "-x",
+            ],
+            vec![
+                "--cwd",
+                "/repo",
+                "--",
+                "env",
+                "HOME=/roles/other/peer",
+                "FOO=bar",
+                "/opt/bin/someagent",
+                "-x",
+            ],
+        ), (
+            "no env pairs: rewrites to today's shape without inventing a variable",
+            vec!["--bg", "--cwd", "/repo", "--", "/opt/claude", "-p"],
+            vec!["--bg", "--cwd", "/repo", "--", "/opt/claude", "-p"],
+        )];
+
+        for (name, input, expected) in cases {
+            let input: Vec<String> = input.into_iter().map(str::to_string).collect();
+            let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                rewrite_for_herdr_core(&input),
+                expected,
+                "case `{name}` must rewrite to the vendor-scoped argv"
+            );
+        }
     }
 }
