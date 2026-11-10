@@ -48,3 +48,141 @@ export function parseHotpotJson(stdout, fallback) {
     return fallback;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Attention-First view model (ticket 13)
+// ---------------------------------------------------------------------------
+
+// Rank of each Attention Letter kind in the Needs-Attention section:
+// NEEDS-HUMAN: / INCIDENT: letters lead, then stalled permissions, then unread
+// handbacks; repeated failures and the Lead rotation mark close the list.
+// Unknown kinds sort last without dropping them.
+export const ATTENTION_KIND_RANK = {
+  "needs-human": 0,
+  incident: 1,
+  "stalled-permission": 2,
+  "unread-handback": 3,
+  "repeated-failure": 4,
+  "lead-context-rotation": 5,
+};
+
+// The Needs-Attention section of a `hotpot status` snapshot: its quiet flag
+// (`true` when nothing renders — the panel collapses to "All quiet") and the
+// letters ranked for display. Every item keeps its stable `att_<id>` key;
+// only exception items are flagged for warning colors, so a downranked letter
+// (attention_feedback) renders neutral per *Colour Only the Exception*.
+export function attentionView(snapshot) {
+  const letters = Array.isArray(snapshot?.attention) ? snapshot.attention : [];
+  const items = letters
+    .map((letter, index) => ({
+      ...letter,
+      rank: ATTENTION_KIND_RANK[letter.kind] ?? Object.keys(ATTENTION_KIND_RANK).length,
+      downranked: Boolean(letter.downranked),
+      exception: !letter.downranked,
+      order: index,
+    }))
+    .sort((a, b) => a.rank - b.rank || a.downranked - b.downranked || a.order - b.order);
+  return { quiet: items.length === 0, items };
+}
+
+// ---------------------------------------------------------------------------
+// Segmented context-bar view model (ticket 13)
+// ---------------------------------------------------------------------------
+
+// The Lead context rotation mark: rotation ticks apply from 150k tokens
+// (`src/runtime/attention.rs: ROTATION_MARK_TOKENS` — the 30% report mark).
+export const ROTATION_MARK_TOKENS = 150000;
+
+function segmentValue(context, field) {
+  const value = context?.[field];
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+// The segmented context bar of one seat: its `Cache Read` / `Fresh Input` /
+// `Output` segments (value plus the fraction of the bar they fill), the total
+// derived as the segments' sum, and the rotation-tick marker set only at or
+// above the rotation mark. A seat with no usage events yields an empty,
+// unticked bar.
+export function contextBarModel(context, rotationMark = ROTATION_MARK_TOKENS) {
+  const segments = [
+    { kind: "cacheRead", label: "Cache Read", value: segmentValue(context, "cacheRead") },
+    { kind: "freshInput", label: "Fresh Input", value: segmentValue(context, "freshInput") },
+    { kind: "output", label: "Output", value: segmentValue(context, "output") },
+  ].map((segment) => ({ ...segment, fraction: 0 }));
+  const total = segments.reduce((sum, segment) => sum + segment.value, 0);
+  for (const segment of segments) {
+    segment.fraction = total > 0 ? segment.value / total : 0;
+  }
+  return {
+    segments,
+    total,
+    rotationTick: total >= rotationMark,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Inline pill pickers & named preset profiles (ticket 13)
+// ---------------------------------------------------------------------------
+
+// The verified agent families the pills offer (`src/runtime/mod.rs:
+// AGENT_FAMILIES`; ZCode rides through `pi`, never as its own family).
+export const AGENT_OPTIONS = ["codex", "claude", "pi"];
+
+// Model options each agent family offers in its pill. Fixture constants of the
+// panel: concrete catalogue names, one list per family.
+export const MODEL_OPTIONS = {
+  codex: ["gpt-5.1-codex", "gpt-5.1", "gpt-5.1-mini"],
+  claude: ["claude-opus-4-6", "claude-sonnet-4-5", "claude-haiku-4-5"],
+  pi: ["zai-glm-chatter", "glm-4.7-air", "glm-4.7-flash"],
+};
+
+// The permitted per-brief thinking efforts (spec user story 19):
+// `ultra`/`ultracode` never appear (`src/runtime/mod.rs: THINKING_EFFORTS`).
+export const THINKING_OPTIONS = ["low", "medium", "high"];
+
+// The roles whose defaults live in `<HOTPOT_HOME>/profiles.json`.
+export const PROFILE_ROLES = ["supervisor", "lead", "peer"];
+
+// Named room preset profiles: one coherent agent/model/thinking map per role
+// seat (spec "Implementation Decisions → UI/UX Ergonomics in GPUI Mods").
+export const PRESET_PROFILES = {
+  "Deep Architecture": {
+    supervisor: { agent: "claude", model: "claude-opus-4-6", thinking: "high" },
+    lead: { agent: "codex", model: "gpt-5.1-codex", thinking: "high" },
+    peer: { agent: "codex", model: "gpt-5.1-codex", thinking: "medium" },
+  },
+  "Fast Iteration": {
+    supervisor: { agent: "claude", model: "claude-sonnet-4-5", thinking: "low" },
+    lead: { agent: "codex", model: "gpt-5.1", thinking: "medium" },
+    peer: { agent: "claude", model: "claude-sonnet-4-5", thinking: "low" },
+  },
+  Budget: {
+    supervisor: { agent: "pi", model: "glm-4.7-air", thinking: "low" },
+    lead: { agent: "pi", model: "glm-4.7-air", thinking: "low" },
+    peer: { agent: "pi", model: "glm-4.7-flash", thinking: "low" },
+  },
+};
+
+export const PRESET_NAMES = Object.keys(PRESET_PROFILES);
+
+function ensurePillValue(value, allowed, label) {
+  if (!allowed.includes(value)) {
+    throw new Error(`invalid ${label} \`${value}\`: permitted values are ${allowed.join("|")}`);
+  }
+  return value;
+}
+
+// The argv the panel hands to `exec("hotpot", ...)`: the minimal
+// `hotpot profile set <agent> <role> <model> --thinking <effort>` write path
+// that atomically updates the role profile defaults in Hotpot Home. Refused
+// efforts (`ultra`/`ultracode`) and unknown roles or families throw before any
+// process is spawned.
+export function profileSetArgs(agent, role, model, thinking) {
+  ensurePillValue(agent, AGENT_OPTIONS, "agent");
+  ensurePillValue(role, PROFILE_ROLES, "role");
+  ensurePillValue(thinking, THINKING_OPTIONS, "thinking");
+  if (typeof model !== "string" || model.trim() === "") {
+    throw new Error(`invalid model \`${model}\`: a non-empty model name is required`);
+  }
+  return ["profile", "set", agent, role, model, "--thinking", thinking];
+}

@@ -12,10 +12,10 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-echo "==> [1/4] Checking shared protocol.js sync across Herdr mods..."
+echo "==> [1/5] Checking shared protocol.js sync across Herdr mods..."
 ./scripts/sync.sh --check
 
-echo "==> [2/4] Checking JavaScript syntax in shared/ and mods/..."
+echo "==> [2/5] Checking JavaScript syntax in shared/ and mods/..."
 JS_FILES=(
   "shared/protocol.js"
   "mods/hotpot/protocol.js"
@@ -28,7 +28,10 @@ for js in "${JS_FILES[@]}"; do
   echo "  OK: ${js}"
 done
 
-echo "==> [3/4] Checking JSON manifests (layouts, mod.json, keys.json)..."
+echo "==> [3/5] Running node tests for the shared view-model helpers..."
+node --test tests/js/*.test.mjs
+
+echo "==> [4/5] Checking JSON manifests (layouts, mod.json, keys.json)..."
 JSON_FILES=(
   "layouts/hotpot.json"
   "mods/hotpot/mod.json"
@@ -40,7 +43,7 @@ for jf in "${JSON_FILES[@]}"; do
   echo "  OK: ${jf}"
 done
 
-echo "==> [4/4] Running Rust test suite (cargo test)..."
+echo "==> [5/5] Running Rust test suite (cargo test)..."
 cargo test
 
 echo "==> All checks passed!"

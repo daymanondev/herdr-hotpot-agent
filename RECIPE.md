@@ -12,10 +12,12 @@ Left to right, building on Herdr's default `main` layout:
 - **Center Work Column**:
   - Top tab bar (`tabs`, 42px).
   - Center stage (`main-stack`): toggles seamlessly between Herdr's active terminal tabs (`{ "tab": "active" }`) and the **Hotpot Session Inspector** (`hotpot-session`), which renders collapsible **💭 Thinking** blocks, **🔧 Tool Calls** (`input` / `output`), **📩 Mailbox** envelopes, and a live prompt box for the selected `Supervisor`, `Lead`, or `Peer`.
-- **Right Dock — Hotpot Panel** (`hotpot`, 360px default, resizable 280–600px, radius 10, `chrome` background):
-  - **Seats**: Live cards for `Supervisor` and `Lead` showing provider/model lane, status dot (`working`, `blocked`, `done`, `idle`), and context-window occupancy (`64k / 128k`).
-  - **Tasks & Peers**: Active SLP waves and Tasks (`T-01`, `T-02`, ...), their disposition (`engineer`, `scout`, `architect`, `reviewer`), Attempt counter (`1/3`), Gate Verdict pill (`GREEN` / `RED` / `RUNNING`), and live activity snippet (`💭 Thinking...` or `🔧 cargo test`).
-  - **Live Mailbox (`Lead ↔ Peer`)**: Real-time stream of `directive`, `claim`, `blocker`, and `verdict` messages.
+- **Right Dock — Hotpot Panel** (`hotpot`, 360px default, resizable 280–600px, radius 10, `chrome` background), Attention-First over the live `hotpot status` snapshot:
+  - **Needs Attention**: Pinned on top, collapsing to a neutral "All quiet" line when nothing is due. Attention Letters (`NEEDS-HUMAN:` / `INCIDENT:`, stalled permissions, unread handbacks, repeated failures, `Lead` context rotation) render keyed by their `att_<id>` ids, and only exception items carry warning colours.
+  - **Seats**: Live cards for `Supervisor`, `Lead`, and dispatched `Peers` with a segmented context bar (**Cache Read** / **Fresh Input** / **Output**) plus a rotation-tick marker (`⟳ rotate`) from the 150k rotation mark, and an inline `agent/model · thinking` pill picker that persists the role's profile default through `hotpot profile set`.
+  - **Room Presets**: *Deep Architecture*, *Fast Iteration*, and *Budget* — one click applies a coherent agent/model/thinking map to the Supervisor, Lead, and Peer role defaults.
+  - **Assignments**: The master list (state, disposition, gate verdict, attempt counter like `1/3`) — clicking a row selects that Peer into the center-stage Session Inspector.
+  - **Live Mailbox (`Lead ↔ Peer`)**: Real-time stream of `directive`, `ask`, `answer`, and `handback` messages.
   - **Status Bar** (`workspace-status`, 28px) along the bottom.
 
 ## How it behaves
