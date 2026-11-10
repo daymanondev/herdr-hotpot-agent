@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{McpProcess, TempDir, create_assignment, init_git_repo, ledger_lines, valid_create};
+use common::{McpProcess, TempDir, create_assignment, git, init_git_repo, ledger_lines, valid_create};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -110,5 +110,73 @@ fn exclusive_lease_acquire_refuse_and_release_after_workspace_close() {
     assert_eq!(redispatch["result"]["state"], "Dispatched");
     assert_eq!(
         redispatch["result"]["lease"]["mode"], "InCheckoutExclusive"
+    );
+}
+
+#[test]
+fn dirty_checkout_refuses_dispatch_and_appends_no_lease_event() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+
+    // An untracked file dirties the tree per `--untracked-files=all`.
+    std::fs::write(repo.path().join("scratch-notes.txt"), "dirty\n").unwrap();
+    let id = create_assignment(&mut mcp, valid_create(&head));
+
+    let refused = mcp.tools_call(
+        json!(2),
+        "assignment_dispatch",
+        json!({"assignment": id}),
+    );
+    let message = error_message(&refused);
+    assert!(
+        message.contains("git precondition failed")
+            && message.contains("not clean")
+            && message.contains("scratch-notes.txt"),
+        "error names the failed git precondition and the dirty entry: {message}"
+    );
+    assert!(
+        ledger_events_of_type(home.path(), "writer_lease_acquired").is_empty(),
+        "no lease event is appended on a refused dispatch"
+    );
+    assert!(
+        ledger_events_of_type(home.path(), "assignment_dispatched").is_empty(),
+        "the refused dispatch never reaches the ledger"
+    );
+    let status = mcp.tools_call(json!(3), "assignment_status", json!({"assignment": id}));
+    assert_eq!(status["result"]["state"], "Draft");
+}
+
+#[test]
+fn head_moved_past_base_commit_refuses_dispatch() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+    let id = create_assignment(&mut mcp, valid_create(&head));
+
+    // A second commit moves HEAD past the assignment's verified baseCommit while
+    // the tree itself stays clean.
+    std::fs::write(repo.path().join("README.md"), "# fixture project\n\nmoved on\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "move HEAD past baseCommit"]);
+    let moved = git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(moved, head);
+
+    let refused = mcp.tools_call(
+        json!(2),
+        "assignment_dispatch",
+        json!({"assignment": id}),
+    );
+    let message = error_message(&refused);
+    assert!(
+        message.contains("git precondition failed")
+            && message.contains("HEAD")
+            && message.contains("baseCommit")
+            && message.contains(&moved),
+        "error names the failed HEAD/baseCommit precondition and the moved HEAD: {message}"
+    );
+    assert!(
+        ledger_events_of_type(home.path(), "writer_lease_acquired").is_empty(),
+        "no lease event is appended on a refused dispatch"
     );
 }
