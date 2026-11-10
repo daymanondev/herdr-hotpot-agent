@@ -40,19 +40,36 @@ impl Drop for TempDir {
 }
 
 /// Expected skeleton of the base Hotpot Home plan, derived from the spec's Provisioner Layer
-/// artifact list (`roles/<codex|claude|pi>/<supervisor|lead|peer>/`, `skills/`,
-/// `skill-projections/<agent>/lead/`, `hotpot.json` marker) — the independent source of truth
-/// for the dry-run assertions below.
+/// artifact list (`roles/<codex|claude|pi>/<supervisor|lead|peer>/` with per-vendor configs
+/// and instruction artifacts, `skills/`, `skill-projections/<agent>/lead/`, `hotpot.json`
+/// marker, `AUTHENTICATION.md`) — the independent source of truth for the dry-run assertions
+/// below.
 fn base_plan_relative_paths() -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for agent in ["codex", "claude", "pi"] {
         for role in ["supervisor", "lead", "peer"] {
             paths.insert(format!("roles/{agent}/{role}"));
+            match agent {
+                "codex" => {
+                    paths.insert(format!("roles/codex/{role}/config.json"));
+                }
+                "claude" => {
+                    paths.insert(format!("roles/claude/{role}/mcp.json"));
+                    paths.insert(format!("roles/claude/{role}/settings.json"));
+                    paths.insert(format!("roles/claude/{role}/CLAUDE.md"));
+                }
+                "pi" => {
+                    paths.insert(format!("roles/pi/{role}/settings.json"));
+                    paths.insert(format!("roles/pi/{role}/APPEND_SYSTEM.md"));
+                }
+                other => panic!("unknown agent {other}"),
+            }
         }
         paths.insert(format!("skill-projections/{agent}/lead"));
     }
     paths.insert("skills".to_string());
     paths.insert("hotpot.json".to_string());
+    paths.insert("AUTHENTICATION.md".to_string());
     paths
 }
 
@@ -173,7 +190,7 @@ fn setup_dry_run_prints_every_planned_path_and_mutates_nothing() {
     let stdout = stdout_of(&out);
     for rel in base_plan_relative_paths() {
         let abs = home.path().join(&rel);
-        let prefix = if rel == "hotpot.json" { "file" } else { "dir" };
+        let prefix = if rel.contains('.') { "file" } else { "dir" };
         assert!(
             stdout.contains(&format!("plan: {prefix} {}", abs.display())),
             "dry-run stdout must print planned {prefix} {rel}:\n{stdout}"

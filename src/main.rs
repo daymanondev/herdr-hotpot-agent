@@ -1,15 +1,20 @@
+pub mod auth;
+pub mod contracts;
 pub mod guard;
 pub mod hc;
 pub mod inspector;
 pub mod provisioner;
+pub mod role_homes;
 pub mod runtime;
 pub mod slp;
 
+use contracts::RenderedContracts;
 use guard::{Role, evaluate_pre_tool_hook};
 use inspector::{SessionInspection, TranscriptItem};
 use provisioner::{
     PlanError, RUNTIME_STATE_DIR, base_home_plan, find_on_path, find_role_credential_files,
-    guard_removal_root, removal_paths, resolve_hotpot_home, runtime_state_active,
+    guard_removal_root, removal_paths, resolve_hotpot_home, runtime_opt_in_from_env,
+    runtime_state_active,
 };
 use serde_json::Value;
 use slp::{HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus};
@@ -269,12 +274,24 @@ fn cmd_mcp(args: &[String]) {
 }
 
 /// `hotpot setup [--apply]`: dry-run desired-state planning over Hotpot Home by default;
-/// `--apply` materializes exactly the planned set.
+/// `--apply` materializes exactly the planned set (nine Role Homes with their vendor configs,
+/// additive role contracts, `AUTHENTICATION.md`, and the `hotpot.json` marker).
 fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
     let apply = args.iter().any(|a| a == "--apply");
     let home = resolve_hotpot_home()?;
+    let contracts = RenderedContracts::from_env();
+    let runtime_opt_in = runtime_opt_in_from_env();
+    let hotpot_bin = env::current_exe().map_err(|e| {
+        PlanError::new("io", format!("failed to resolve the running hotpot binary: {e}"))
+    })?;
     let hc_available = find_on_path("hc").is_some();
-    let plan = base_home_plan(&home, hc_available);
+    let plan = base_home_plan(
+        &home,
+        &hotpot_bin,
+        &contracts,
+        runtime_opt_in,
+        hc_available,
+    );
     plan.validate()?;
 
     let stdout = io::stdout();
@@ -343,6 +360,37 @@ fn default_hotpot_home() -> String {
         .unwrap_or_else(|_| ".hotpot".to_string())
 }
 
+/// `hotpot auth login <codex|claude|pi> <supervisor|lead|peer>`: interactive vendor login
+/// scoped to exactly one Seat's Role Home (credentials land inside that seat only).
+fn cmd_auth(args: &[String]) {
+    let usage = "usage: hotpot auth login <codex|claude|pi> <supervisor|lead|peer>";
+    if args.first().map(String::as_str) != Some("login") || args.len() != 3 {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    }
+    let (agent, role) = (args[1].as_str(), args[2].as_str());
+    let home = match resolve_hotpot_home() {
+        Ok(home) => home,
+        Err(err) => {
+            eprintln!("hotpot: {err}");
+            std::process::exit(1);
+        }
+    };
+    match auth::login(&home, agent, role) {
+        Ok(code) if code != 0 => {
+            eprintln!(
+                "hotpot: `{agent} login` for the {agent}/{role} seat exited with {code}"
+            );
+            std::process::exit(code);
+        }
+        Ok(_) => println!("auth: {agent} {role} login session scoped to {}", role_homes::role_home_dir(&home, agent, role).display()),
+        Err(err) => {
+            eprintln!("hotpot: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let sub = args.get(1).map(String::as_str).unwrap_or("status");
@@ -363,9 +411,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "auth" => cmd_auth(&args[2..]),
         "--help" | "-h" | "help" => {
             println!("hotpot 0.1.0 — Rust SLP verification engine & session inspector for Herdr");
-            println!("Commands: status, inspect, hook, mcp, setup [--apply], remove [--apply]");
+            println!("Commands: status, inspect, hook, mcp, setup [--apply], remove [--apply],");
+            println!("           auth login <codex|claude|pi> <supervisor|lead|peer>");
         }
         _ => cmd_status(&args[1..]),
     }

@@ -7,6 +7,8 @@
 //! `~/.codex`, `~/.claude`, and `~/.pi/agent` are read-only inputs, and `runtime/v1/` (the
 //! runtime coordinator's append-only state) is preserve-only — never planned, never written.
 
+use crate::contracts::RenderedContracts;
+use crate::role_homes;
 use serde_json::json;
 use std::env;
 use std::fmt;
@@ -379,14 +381,27 @@ pub fn find_on_path(bin: &str) -> Option<PathBuf> {
     None
 }
 
-/// The deterministic `hotpot.json` marker content for the base plan.
-pub fn hotpot_marker_contents() -> String {
+/// The deterministic `hotpot.json` marker content for the base plan: the short digest of the
+/// rendered role contracts and the runtime opt-in state (the Runtime Coordinator is opt-in;
+/// `runtime/v1/` stays preserve-only either way).
+pub fn hotpot_marker_contents(contracts: &RenderedContracts, runtime_opt_in: bool) -> String {
     serde_json::to_string_pretty(&json!({
         "marker": "hotpot",
-        "version": 1
+        "version": 1,
+        "runtime_opt_in": runtime_opt_in,
+        "role_contract_digest": contracts.digest,
     }))
     .unwrap()
         + "\n"
+}
+
+/// Runtime opt-in state read from the environment: `HOTPOT_RUNTIME_OPT_IN` set to a truthy
+/// value (`1`, `true`, `yes`, `on`, case-insensitive) opts this Home into the Runtime
+/// Coordinator; anything else (including unset) stays opted out.
+pub fn runtime_opt_in_from_env() -> bool {
+    env::var("HOTPOT_RUNTIME_OPT_IN")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Finds role-owned credential files under `<home>/roles/` so `hotpot remove` can warn
@@ -463,15 +478,30 @@ pub fn guard_removal_root(home: &Path) -> Result<(), PlanError> {
     Ok(())
 }
 
-/// Builds the base Hotpot Home plan: the home skeleton directories plus the `hotpot.json`
-/// marker. `runtime/` is never part of a plan (preserve-only); `hc` profile changes are only
-/// planned when `hc` is discoverable on `PATH`. Later tickets plug Role Home, hygiene, and
-/// skill-projection generators into this same [`Plan`].
-pub fn base_home_plan(home: &Path, hc_available: bool) -> Plan {
+/// Builds the base Hotpot Home plan: the home skeleton directories, the nine Role Homes
+/// (vendor configs + additive instruction artifacts, via [`role_homes::seat_plan_items`]),
+/// `AUTHENTICATION.md`, and the `hotpot.json` marker carrying the role-contract digest and
+/// runtime opt-in state. `runtime/` is never part of a plan (preserve-only); `hc` profile
+/// changes are only planned when `hc` is discoverable on `PATH`. Later tickets plug hygiene
+/// and skill-projection generators into this same [`Plan`].
+pub fn base_home_plan(
+    home: &Path,
+    hotpot_bin: &Path,
+    contracts: &RenderedContracts,
+    runtime_opt_in: bool,
+    hc_available: bool,
+) -> Plan {
     let mut items: Vec<PlanItem> = Vec::new();
     for agent in AGENTS {
         for role in ROLES {
-            items.push(PlanItem::Dir(home.join("roles").join(agent).join(role)));
+            items.push(PlanItem::Dir(role_homes::role_home_dir(home, agent, role)));
+            items.extend(role_homes::seat_plan_items(
+                home,
+                hotpot_bin,
+                agent,
+                role,
+                contracts.for_role(role),
+            ));
         }
     }
     items.push(PlanItem::Dir(home.join("skills")));
@@ -482,7 +512,11 @@ pub fn base_home_plan(home: &Path, hc_available: bool) -> Plan {
     }
     items.push(PlanItem::File {
         path: home.join("hotpot.json"),
-        contents: hotpot_marker_contents(),
+        contents: hotpot_marker_contents(contracts, runtime_opt_in),
+    });
+    items.push(PlanItem::File {
+        path: home.join("AUTHENTICATION.md"),
+        contents: role_homes::authentication_md(),
     });
     if hc_available {
         items.push(PlanItem::HcProfileSet {
