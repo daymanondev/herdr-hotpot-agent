@@ -29,7 +29,8 @@
 //! - `permission_requested`  { permission, assignment?, detail? } (fixture/hook seam; stalled past 5 minutes without a resolve)
 //! - `permission_resolved`   { permission }
 //! - `lead_message`          { text } (a `NEEDS-HUMAN:` / `INCIDENT:` line raises a letter)
-//! - `context_usage`         { seat, tokens } (the Lead crossing 150k tokens raises the rotation letter)
+//! - `context_usage`         { seat, tokens?, cacheRead?, freshInput?, output? } (the Lead crossing 150k tokens raises the rotation letter; the segmented shape feeds `hotpot status` / `hotpot inspect`, ticket 12)
+//! - `seat_launched`         { seat, role, agent, assignment? } (written by `hotpot seat launch`; feeds the `hotpot status` seat projection, ticket 12)
 //! - `attention_delivered`   { key } (recorded by `room_status`; drives per-key rate suppression)
 //! - `attention_feedback`    { key, action: mute|snooze|downrank, forSeconds? }
 //! - `message_to_lead`       { from, message } (the durable Supervisor→Lead mailbox event)
@@ -174,6 +175,15 @@ impl Ledger {
     /// Path of the ledger file (used by tests and diagnostics).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Creates the ledger's parent directories when missing — the `Ledger::at`
+    /// writer path (`Ledger::open` already ensures them for its callers).
+    pub fn ensure_parent_dir(&self) -> Result<(), LedgerError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(())
     }
 
     /// The per-project runtime dir (`<state>/runtime/v1/<slug>`) hosting the

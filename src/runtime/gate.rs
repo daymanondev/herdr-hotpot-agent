@@ -139,8 +139,10 @@ pub fn run(
         fs::write(&tail_path, masked).map_err(|e| format!("gate-runner: {e}"))?;
         event["tail"] = json!(tail_path.to_string_lossy());
     }
-    ledger.append(event).map_err(|e| e.to_string())?;
 
+    // The throwaway checkout is torn down before the completion event lands, so
+    // `gate_completed` always describes a fully finished run — scratch included
+    // — and a watcher reacting to it never observes a half-cleaned gates dir.
     if let Some(checkout) = detached {
         let path = checkout.to_string_lossy().to_string();
         let _ = Command::new("git")
@@ -150,6 +152,7 @@ pub fn run(
             .output();
         let _ = fs::remove_dir_all(&checkout);
     }
+    ledger.append(event).map_err(|e| e.to_string())?;
     Ok(())
 }
 

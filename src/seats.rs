@@ -24,7 +24,7 @@ use crate::hc::{self, HcTerminalSummary};
 use crate::hygiene;
 use crate::provisioner::{PlanError, find_on_path};
 use crate::role_homes::{role_home_dir, seat_correlation};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// The canonical version marker carried by every hotpot-created `hc` terminal.
@@ -298,5 +298,32 @@ pub fn launch_seat(
         &binding,
         &vendor_bin,
     );
-    hc::run_terminal(&argv).map(|_| LaunchOutcome::Launched)
+    hc::run_terminal(&argv)?;
+
+    // The launch is durable in the project ledger so `hotpot status` can project
+    // the seat even while `hc` is unreachable (a reused Lead already carries its
+    // earlier launch record). Best-effort fields only: the terminal address and
+    // status always come from the live `hc` listing.
+    let mut event = json!({
+        "type": "seat_launched",
+        "seat": launch_correlation(agent, role, &binding),
+        "role": role,
+        "agent": agent,
+    });
+    if let Some(binding) = &binding {
+        event["assignment"] = json!(binding.assignment);
+    }
+    let ledger = crate::runtime::Ledger::at(
+        home.join("runtime")
+            .join("v1")
+            .join(&slug)
+            .join("ledger.jsonl"),
+    );
+    ledger.ensure_parent_dir().map_err(|e| {
+        PlanError::new("io", format!("failed to record the seat launch: {e}"))
+    })?;
+    ledger
+        .append(event)
+        .map_err(|e| PlanError::new("io", format!("failed to record the seat launch: {e}")))?;
+    Ok(LaunchOutcome::Launched)
 }
