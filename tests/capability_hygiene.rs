@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -138,6 +139,9 @@ fn write_fake_pi(bin_dir: &Path, extensions: &[&str], status: i32) {
 }
 
 /// Full byte snapshot of every file under `root` (recursive) for "wrote nothing" assertions.
+/// Symlinks (the Lead `skills` aggregates and the onboarding wiring planned by the skill
+/// projection) are recorded by their link text and never followed, so a retargeted or
+/// replaced link still changes the snapshot.
 fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
@@ -149,7 +153,16 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
                 continue;
             }
             let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
-            out.insert(rel, fs::read(&path).unwrap());
+            let bytes = if path.is_symlink() {
+                fs::read_link(&path)
+                    .unwrap()
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec()
+            } else {
+                fs::read(&path).unwrap()
+            };
+            out.insert(rel, bytes);
         }
     }
     out
