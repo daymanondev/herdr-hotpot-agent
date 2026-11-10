@@ -11,31 +11,95 @@ pub const REQUIRED_CONTRACT_SECTIONS: &[&str] = &[
     "4. Verification",
 ];
 
+/// Segmented context-window occupancy of one seat (spec: "Render segmented context
+/// bars (`Cache Read` / `Fresh Input` / `Output`) with role rotation ticks"): the
+/// three segments, their total, and the rotation-tick flag set once the total
+/// reaches the spec's rotation mark (>= 150k tokens).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSegments {
+    pub cache_read: u64,
+    pub fresh_input: u64,
+    pub output: u64,
+    pub total: u64,
+    pub rotation_tick: bool,
+}
+
+impl ContextSegments {
+    /// Segments plus their total and rotation-tick flag for a rotation mark of
+    /// `rotation_mark_tokens` (the tick applies from the mark, inclusive).
+    pub fn from_parts(cache_read: u64, fresh_input: u64, output: u64, rotation_mark_tokens: u64) -> Self {
+        let total = cache_read + fresh_input + output;
+        Self {
+            cache_read,
+            fresh_input,
+            output,
+            total,
+            rotation_tick: total >= rotation_mark_tokens,
+        }
+    }
+
+    /// The all-zero, no-tick segments reported for a seat with no usage events.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// One live `Seat` as projected by `hotpot status` (see [`crate::status`]). The
+/// `provider` / `context_tokens` aliases keep the current `mods/hotpot` cards
+/// rendering until tickets 13/14 rebuild them against this contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeatStatus {
+    /// The seat's correlation id (the `hotpot.correlation` label).
     pub id: String,
     pub role: String,
     pub title: String,
+    /// The seat's agent family (`codex` | `claude` | `pi`).
+    pub agent: String,
+    /// Compat alias of `agent` (read by `mods/hotpot/main.js` until 13/14).
     pub provider: String,
-    pub model: String,
+    /// From the dispatch record or the role profile defaults in Hotpot Home.
+    pub model: Option<String>,
+    /// The per-brief thinking effort (peer) or the role profile default.
+    pub thinking: Option<String>,
+    /// The `hc` terminal status; `offline` when the seat has no live terminal.
     pub status: String,
     pub terminal: Option<String>,
+    /// The assignment a Peer seat is bound to.
+    pub assignment: Option<String>,
+    pub context: ContextSegments,
+    /// Compat alias of `context.total` (read by `mods/hotpot/main.js` until 13/14).
     pub context_tokens: u64,
     pub activity: String,
 }
 
+/// One `Assignment` of the master list `hotpot status` serves (its `status`,
+/// `agent_id`, `provider`, and `context_tokens` fields are compat aliases kept
+/// for `mods/hotpot/main.js` until tickets 13/14 rebuild the task cards).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskStatus {
     pub id: String,
+    pub state: String,
     pub disposition: String,
-    pub status: String,
     pub verdict: Option<String>,
+    /// The handback cycle number: 1 before the first handback, +1 per rework.
     pub attempt: u32,
+    /// The assignment's outcome statement.
     pub summary: String,
-    pub provider: String,
-    pub model: String,
-    pub agent_id: String,
+    pub correlation: Option<String>,
+    /// Compat alias of `correlation` (read by `mods/hotpot/main.js` until 13/14).
+    pub agent_id: Option<String>,
+    pub agent: Option<String>,
+    /// Compat alias of `agent` (read by `mods/hotpot/main.js` until 13/14).
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub workspace: Option<String>,
     pub terminal: Option<String>,
+    /// Compat alias of `state` (the live mod's spinner slot) until 13/14.
+    pub status: String,
+    pub context: ContextSegments,
+    /// Compat alias of `context.total` (read by `mods/hotpot/main.js` until 13/14).
     pub context_tokens: u64,
     pub activity: String,
 }
@@ -48,13 +112,21 @@ pub struct MailboxEntry {
     pub summary: String,
 }
 
+/// The `hotpot status` projection: the Project's seats, assignment master list,
+/// due Attention Letters, and mailbox, rebuilt from the runtime ledger plus the
+/// live `hc` terminal labels on every call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotpotStatusSnapshot {
     pub project: String,
     pub workspace: String,
     pub mode: String,
+    #[serde(rename = "generatedAt")]
+    pub generated_at: u64,
     pub seats: Vec<SeatStatus>,
     pub tasks: Vec<TaskStatus>,
+    /// The currently due Attention Letters (ticket 11), keyed by their stable
+    /// `att_<id>` keys; served read-only so polling never consumes a batch.
+    pub attention: Vec<Value>,
     pub mailbox: Vec<MailboxEntry>,
 }
 

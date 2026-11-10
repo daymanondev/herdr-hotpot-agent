@@ -192,6 +192,20 @@ fn trailing_consecutive_reds(events: &[Value], assignment: &str) -> usize {
         .count()
 }
 
+/// The total token occupancy a `context_usage` event reports: its `tokens` field
+/// when carried, else the sum of its `cacheRead` / `freshInput` / `output`
+/// segments (the segmented shape `hotpot status` serves, ticket 12).
+pub fn usage_total(event: &Value) -> Option<u64> {
+    if let Some(tokens) = event.get("tokens").and_then(Value::as_u64) {
+        return Some(tokens);
+    }
+    let segments = ["cacheRead", "freshInput", "output"]
+        .iter()
+        .filter_map(|key| event.get(*key).and_then(Value::as_u64))
+        .sum::<u64>();
+    (segments > 0).then_some(segments)
+}
+
 /// The rotation letter for the Lead's latest `context_usage` event once it sits
 /// at or past the rotation mark. The letter clears itself when a later usage
 /// event reports the Lead back under the mark.
@@ -200,10 +214,7 @@ fn lead_rotation(events: &[Value], config: &AttentionConfig) -> Vec<Letter> {
         .iter()
         .filter(|e| e.get("type").and_then(Value::as_str) == Some("context_usage"))
         .filter(|e| e.get("seat").and_then(Value::as_str) == Some("lead"))
-        .filter_map(|e| {
-            let tokens = e.get("tokens").and_then(Value::as_u64)?;
-            Some((e, tokens))
-        })
+        .filter_map(|e| usage_total(e).map(|total| (e, total)))
         .next_back();
     let Some((_event, tokens)) = latest.filter(|(_, tokens)| *tokens >= config.rotation_mark_tokens)
     else {
