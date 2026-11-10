@@ -13,13 +13,20 @@
 //! evidence (see [`evidence`]). `gate_run` re-executes the Gate against the
 //! handed-back candidate in a detached background process whose completion is
 //! recorded as a ledger event with a masked red tail (see [`gate`] and
-//! [`masking`]); nothing is ever auto-accepted on a green gate.
+//! [`masking`]); nothing is ever auto-accepted on a green gate. The Supervisor
+//! surface detects and batch-delivers rate-limited Attention Letters, honors
+//! `attention_feedback`, routes Human directives with `message_lead`, and
+//! replaces a context-rotated Lead at a verified quiet point through the
+//! `lead_replace_prepare` → review → `lead_replace_confirm` sequence (see
+//! [`attention`]).
 
+pub mod attention;
 pub mod evidence;
 pub mod gate;
 pub mod ledger;
 pub mod leases;
 pub mod masking;
+pub mod replacement;
 
 pub use ledger::{Ledger, project_slug, sha1_hex};
 pub use leases::{IN_CHECKOUT_EXCLUSIVE, WriterLease};
@@ -314,6 +321,12 @@ fn call_tool(
         "workspace_close" => workspace_close(ledger, project_root, args),
         "lease_reclaim" => lease_reclaim(ledger, args),
         "runtime_findings" => runtime_findings(ledger),
+        "room_status" => room_status(ledger),
+        "attention_feedback" => attention_feedback(ledger, args),
+        "message_lead" => message_lead(ledger, state_dir, project_root, args),
+        "lead_replace_prepare" => lead_replace_prepare(ledger),
+        "lead_replace_confirm" => lead_replace_confirm(ledger, state_dir, project_root, args),
+        "lead_replace_cancel" => lead_replace_cancel(ledger, args),
         "ask" => peer_ask(ledger, correlation, args),
         "handoff" => peer_handoff(ledger, correlation, args),
         _ => Err(RpcError::not_implemented(format!(
@@ -1239,11 +1252,20 @@ fn gate_run(
 }
 
 /// Supervisor `runtime_findings`: the verified findings of the runtime replayed
-/// from the ledger — gate completion verdicts (with masked tail paths) and
-/// handbacks whose changed paths exceeded the declared Write Scope.
+/// from the ledger — gate completion verdicts (with masked tail paths), handbacks
+/// whose changed paths exceeded the declared Write Scope, and the currently due
+/// Attention Letters (surfaced read-only, without consuming the delivery batch
+/// that `room_status` records).
 fn runtime_findings(ledger: &Ledger) -> Result<Value, RpcError> {
     let events = ledger.read_events();
     let mut findings = Vec::new();
+    let letters = attention::deliver_letters(
+        ledger,
+        ledger::now_secs(),
+        &attention::AttentionConfig::from_env(),
+        false,
+    )
+    .map_err(|e| RpcError::internal(format!("runtime_findings: {e}")))?;
     for event in &events {
         match event.get("type").and_then(Value::as_str).unwrap_or("") {
             "gate_completed" => {
@@ -1278,13 +1300,423 @@ fn runtime_findings(ledger: &Ledger) -> Result<Value, RpcError> {
             _ => {}
         }
     }
+    for letter in letters {
+        let mut finding = json!({"kind": "attention"});
+        if let (Some(base), Some(extra)) = (finding.as_object_mut(), letter.as_object()) {
+            for (field, value) in extra {
+                base.insert(field.clone(), value.clone());
+            }
+        }
+        findings.push(finding);
+    }
     Ok(json!({"findings": findings}))
+}
+
+/// Supervisor `room_status`: the live room snapshot of the Project — the
+/// assignment board, the seats derivable from the ledger, and the current
+/// batch of Attention Letters (whose delivery this call records; see
+/// [`attention::deliver_letters`]).
+fn room_status(ledger: &Ledger) -> Result<Value, RpcError> {
+    const TOOL: &str = "room_status";
+    let now = ledger::now_secs();
+    let config = attention::AttentionConfig::from_env();
+    let letters =
+        attention::deliver_letters(ledger, now, &config, true)
+            .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+
+    let state = RuntimeState::load(ledger);
+    let assignments: Vec<Value> = state
+        .assignments()
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "state": a.state,
+                "disposition": a.disposition,
+                "correlation": a.correlation,
+                "gateVerdict": a.gate_verdict,
+            })
+        })
+        .collect();
+    // Peer seats are the dispatched correlations of live assignments; the Lead
+    // seat is always the Project's single arbiter (replaced only through the
+    // quiet-point sequence of `lead_replace_prepare`/`confirm`).
+    let seats: Vec<Value> = state
+        .assignments()
+        .iter()
+        .filter(|a| a.correlation.is_some() && !matches!(a.state.as_str(), "Stopped" | "Closed"))
+        .map(|a| {
+            json!({
+                "role": "peer",
+                "correlation": a.correlation,
+                "assignment": a.id,
+                "state": a.state,
+            })
+        })
+        .chain(std::iter::once(json!({
+            "role": "lead",
+            "correlation": "lead",
+            "attention": "active",
+        })))
+        .collect();
+
+    Ok(json!({
+        "project": ledger
+            .project_dir()
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        "generatedAt": now,
+        "seats": seats,
+        "assignments": assignments,
+        "attention": {
+            "allQuiet": letters.is_empty(),
+            "letters": letters,
+        },
+    }))
+}
+
+/// Supervisor `attention_feedback { key, action: mute|snooze|downrank,
+/// forSeconds? }`: rate a noisy Attention Letter by its stable key. The effect
+/// (suppression, snooze window, downranking) is honored by every subsequent
+/// batch (see [`attention::feedback_effect`]); the most recent feedback for a
+/// key wins.
+fn attention_feedback(ledger: &Ledger, args: &Value) -> Result<Value, RpcError> {
+    const TOOL: &str = "attention_feedback";
+    let key = arg_str(args, TOOL, "key")?;
+    let action_raw = arg_str(args, TOOL, "action")?;
+    let Some(action) = attention::FEEDBACK_ACTIONS
+        .iter()
+        .find(|action| **action == action_raw)
+    else {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: invalid action `{action_raw}`: permitted actions are {}",
+            attention::FEEDBACK_ACTIONS.join("|")
+        )));
+    };
+
+    let mut event = json!({"type": "attention_feedback", "key": key, "action": action});
+    if *action == "snooze" {
+        match args.get("forSeconds") {
+            None | Some(Value::Null) => {}
+            Some(Value::Number(n)) => {
+                let secs = n.as_u64().filter(|s| *s > 0).ok_or_else(|| {
+                    RpcError::invalid_params(format!(
+                        "{TOOL}: `forSeconds` must be a positive integer of seconds"
+                    ))
+                })?;
+                event["forSeconds"] = json!(secs);
+            }
+            Some(_) => {
+                return Err(RpcError::invalid_params(format!(
+                    "{TOOL}: `forSeconds` must be a positive integer of seconds"
+                )));
+            }
+        }
+    }
+    ledger
+        .append(event)
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+
+    let config = attention::AttentionConfig::from_env();
+    let effect = attention::feedback_effect(&ledger.read_events(), &key, ledger::now_secs(), &config);
+    let effect_json = match effect {
+        attention::FeedbackEffect::Muted => json!("muted"),
+        attention::FeedbackEffect::Snoozed { until } => json!({"snoozedUntil": until}),
+        attention::FeedbackEffect::Downranked => json!("downranked"),
+        attention::FeedbackEffect::None => json!("none"),
+    };
+    Ok(json!({"key": key, "action": action, "effect": effect_json}))
+}
+
+/// Supervisor `message_lead { message }`: route a Human directive to the
+/// Project's Lead. The durable guarantee is the `message_to_lead` ledger
+/// mailbox event (observable from any session replaying the ledger); when the
+/// Project's live Lead terminal is discoverable through `hc`, the message is
+/// additionally delivered with `hc send` (best-effort, honestly reported).
+fn message_lead(
+    ledger: &Ledger,
+    state_dir: &Path,
+    project_root: &Path,
+    args: &Value,
+) -> Result<Value, RpcError> {
+    const TOOL: &str = "message_lead";
+    let message = arg_str(args, TOOL, "message")?;
+
+    ledger
+        .append(json!({"type": "message_to_lead", "from": "supervisor", "message": message}))
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+
+    let slug = project_slug(project_root);
+    let hc_send = match crate::seats::project_lead_terminal(state_dir, &slug) {
+        Ok(Some(address)) => match crate::hc::send_terminal_prompt(&address, &message) {
+            Ok(()) => json!({"delivered": true, "target": address}),
+            Err(reason) => json!({"delivered": false, "target": address, "reason": reason}),
+        },
+        Ok(None) => json!({
+            "delivered": false,
+            "reason": "no live lead terminal for the project; the mailbox event stays durable",
+        }),
+        Err(err) => json!({"delivered": false, "reason": err.to_string()}),
+    };
+    Ok(json!({"recorded": true, "hcSend": hc_send}))
+}
+
+/// Supervisor `lead_replace_prepare`: request a structured handoff from the
+/// Lead at a verified quiet point. Refuses (JSON-RPC error) while any
+/// assignment holds live work — a dispatched or reworking writable assignment
+/// or an unanswered ask — because replacing the Lead mid-flight would strand
+/// it. At a quiet point the room's handoff draft (assignment board, open
+/// attention, rendered `handoffText`) is recorded as `lead_replace_prepared`
+/// for review; exactly one replacement may be in flight at a time.
+fn lead_replace_prepare(ledger: &Ledger) -> Result<Value, RpcError> {
+    const TOOL: &str = "lead_replace_prepare";
+    let events = ledger.read_events();
+    if let Some(in_flight) = replacement::in_flight_replacement(&events) {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: a lead replacement (`{in_flight}`) is already prepared; confirm or cancel it before preparing another"
+        )));
+    }
+
+    let state = RuntimeState::from_events(&events);
+    let blockers = replacement::quiet_point_blockers(&state);
+    if !blockers.is_empty() {
+        let listed = blockers
+            .iter()
+            .map(|(id, reason)| format!("`{id}` ({reason})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: not a quiet point — live work in flight: {listed}; close, answer, or take the handbacks before replacing the Lead"
+        )));
+    }
+
+    let now = ledger::now_secs();
+    let letters = attention::deliver_letters(
+        ledger,
+        now,
+        &attention::AttentionConfig::from_env(),
+        false,
+    )
+    .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    let slug = ledger
+        .project_dir()
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let draft = replacement::build_draft(&slug, &state, &letters, now);
+    let replacement_id = replacement::next_replacement_id(&events);
+    let handoff_text = draft
+        .get("handoffText")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    ledger
+        .append(json!({
+            "type": "lead_replace_prepared",
+            "replacement": replacement_id,
+            "draft": draft,
+            "handoffText": handoff_text,
+        }))
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    Ok(json!({
+        "replacement": replacement_id,
+        "quietPoint": {"verified": true},
+        "assignments": draft["assignments"].clone(),
+        "handoffText": handoff_text,
+    }))
+}
+
+/// Supervisor `lead_replace_confirm { replacement?, handoffText?, agent? }`:
+/// archive the old Lead and launch the successor Lead via the ticket-06 seat
+/// launcher (same canonical project labels), seeded with the reviewed —
+/// possibly edited — handoff text. The text lands in the successor's seed
+/// record on disk (`lead-replacements/<id>-seed.md`, referenced from the
+/// ledger event) and, when the successor terminal is addressable, in an
+/// `hc send` of the seed. Requires the quiet point to still hold.
+fn lead_replace_confirm(
+    ledger: &Ledger,
+    state_dir: &Path,
+    project_root: &Path,
+    args: &Value,
+) -> Result<Value, RpcError> {
+    const TOOL: &str = "lead_replace_confirm";
+    let events = ledger.read_events();
+    let Some(in_flight) = replacement::in_flight_replacement(&events) else {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: no prepared lead replacement to confirm; call `lead_replace_prepare` at a quiet point first"
+        )));
+    };
+    if let Some(requested) = args.get("replacement").and_then(Value::as_str)
+        && requested != in_flight
+    {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: replacement `{requested}` is not the in-flight replacement (`{in_flight}`)"
+        )));
+    }
+
+    // The quiet point must still hold at confirm time.
+    let state = RuntimeState::from_events(&events);
+    let blockers = replacement::quiet_point_blockers(&state);
+    if !blockers.is_empty() {
+        let listed = blockers
+            .iter()
+            .map(|(id, reason)| format!("`{id}` ({reason})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: not a quiet point anymore — live work in flight: {listed}"
+        )));
+    }
+
+    // The reviewed text: the edited argument, else the prepared draft verbatim.
+    let handoff_text = match args.get("handoffText") {
+        None | Some(Value::Null) => events
+            .iter()
+            .filter(|e| {
+                e.get("type").and_then(Value::as_str) == Some("lead_replace_prepared")
+                    && e.get("replacement").and_then(Value::as_str) == Some(in_flight.as_str())
+            })
+            .next_back()
+            .and_then(|e| e.get("handoffText").and_then(Value::as_str))
+            .map(str::to_string)
+            .unwrap_or_default(),
+        Some(Value::String(text)) => text.clone(),
+        Some(_) => {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: `handoffText` must be a string (the reviewed handoff text)"
+            )));
+        }
+    };
+
+    // The successor's agent family (the verified families of the launcher).
+    let agent = match args.get("agent") {
+        None | Some(Value::Null) => "codex".to_string(),
+        Some(Value::String(raw)) => {
+            let requested = raw.trim();
+            AGENT_FAMILIES
+                .iter()
+                .find(|family| family.eq_ignore_ascii_case(requested))
+                .map(|family| family.to_string())
+                .ok_or_else(|| {
+                    RpcError::invalid_params(format!(
+                        "{TOOL}: invalid agent family `{requested}`: the verified seat families are {}",
+                        AGENT_FAMILIES.join("|")
+                    ))
+                })?
+        }
+        Some(_) => {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: `agent` must be a seat family string ({})",
+                AGENT_FAMILIES.join("|")
+            )));
+        }
+    };
+
+    // 1. Archive the old Lead first: the launcher's reuse check must never
+    //    hand the archived terminal back as the successor.
+    let slug = project_slug(project_root);
+    let terminal = crate::seats::project_lead_terminal(state_dir, &slug)
+        .ok()
+        .flatten();
+    let already_archived = events.iter().any(|e| {
+        e.get("type").and_then(Value::as_str) == Some("lead_archived")
+            && e.get("replacement").and_then(Value::as_str) == Some(in_flight.as_str())
+    });
+    if !already_archived {
+        let mut archive = json!({"type": "lead_archived", "replacement": in_flight});
+        if let Some(address) = &terminal {
+            archive["terminal"] = json!(address);
+        }
+        ledger
+            .append(archive)
+            .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    }
+
+    // 2. Launch the successor Lead via the ticket-06 launcher (same project
+    //    labels, Role Home scoping, and hygiene flags as every seat launch).
+    let launch = crate::seats::launch_seat(state_dir, "lead", &agent, project_root, None);
+    if let Err(err) = launch {
+        return Err(RpcError::internal(format!(
+            "{TOOL}: successor lead launch failed: {err}; the old lead is archived in the ledger — \
+             re-run confirm to retry the launch, or investigate the launcher"
+        )));
+    }
+
+    // 3. Seed the successor with the reviewed handoff: the durable seed record
+    //    plus a best-effort `hc send` to the project's live lead terminal.
+    let seed_record = replacement::seed_record_path(ledger, &in_flight);
+    if let Some(parent) = seed_record.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            RpcError::internal(format!("{TOOL}: failed to create the seed record dir: {e}"))
+        })?;
+    }
+    std::fs::write(&seed_record, &handoff_text).map_err(|e| {
+        RpcError::internal(format!("{TOOL}: failed to write the seed record: {e}"))
+    })?;
+    let mut hc_seed = json!({"delivered": false, "reason": "no addressable lead terminal"});
+    if let Ok(Some(address)) = crate::seats::project_lead_terminal(state_dir, &slug) {
+        hc_seed = match crate::hc::send_terminal_prompt(&address, &handoff_text) {
+            Ok(()) => json!({"delivered": true, "target": address}),
+            Err(reason) => json!({"delivered": false, "target": address, "reason": reason}),
+        };
+    }
+
+    let correlation = crate::seats::launch_correlation(&agent, "lead", &None);
+    ledger
+        .append(json!({
+            "type": "lead_replace_confirmed",
+            "replacement": in_flight,
+            "handoffText": handoff_text,
+            "seedRecord": seed_record.to_string_lossy(),
+            "successorAgent": agent,
+            "successorCorrelation": correlation,
+        }))
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    Ok(json!({
+        "replacement": in_flight,
+        "state": "confirmed",
+        "archived": true,
+        "terminal": terminal,
+        "successor": {"agent": agent, "correlation": correlation},
+        "seedRecord": seed_record.to_string_lossy(),
+        "handoffText": handoff_text,
+        "hcSeed": hc_seed,
+    }))
+}
+
+/// Supervisor `lead_replace_cancel { replacement? }`: abort an in-flight Lead
+/// replacement. Nothing is archived and nothing is launched — the old Lead
+/// stays the Project's active arbiter.
+fn lead_replace_cancel(ledger: &Ledger, args: &Value) -> Result<Value, RpcError> {
+    const TOOL: &str = "lead_replace_cancel";
+    let events = ledger.read_events();
+    let Some(in_flight) = replacement::in_flight_replacement(&events) else {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: no in-flight lead replacement to cancel"
+        )));
+    };
+    if let Some(requested) = args.get("replacement").and_then(Value::as_str)
+        && requested != in_flight
+    {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: replacement `{requested}` is not the in-flight replacement (`{in_flight}`)"
+        )));
+    }
+    ledger
+        .append(json!({"type": "lead_replace_cancelled", "replacement": in_flight}))
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    Ok(json!({
+        "replacement": in_flight,
+        "state": "cancelled",
+        "lead": "active",
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // Peer tools (server-derived identity; spec user stories 23-24)
 // ---------------------------------------------------------------------------
-
 /// Structured `Challenge Signal` stances a Peer may raise via `ask`
 /// (spec: Role-Asymmetric MCP Surface, Peer paragraph).
 pub const CHALLENGE_SIGNALS: &[&str] = &["REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"];

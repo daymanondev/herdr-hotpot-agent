@@ -87,3 +87,11 @@ _Avoid_: silent workaround, scope creep
 **Attention Letter**:
 A batched, evidence-backed notification (`[hotpot attention att_<id>]`) delivered to the `Project`'s `Supervisor` when the runtime detects a stalled permission, an unread `Peer` handback, repeated failures, `NEEDS-HUMAN:` or `INCIDENT:` markers, or `Lead` context crossing its rotation mark.
 _Avoid_: polling loop, raw log stream
+
+**Quiet Point**:
+A verified room state in which no `Assignment` holds live work — every `Assignment` is closed or cleanly handed back — the only state in which a `Lead` replacement may be prepared. A cleanly handed-back `Assignment` awaits the successor `Lead`'s integration, so it does not block.
+_Avoid_: idle moment, whenever
+
+**Lead Replacement**:
+The structured `lead_replace_prepare` → review/edit → `lead_replace_confirm` sequence that archives the old `Lead` and launches a successor `Lead` (same project labels) seeded with the reviewed handoff. Any path that skips the sequence is out of scope by design.
+_Avoid_: hot swap, silent respawn

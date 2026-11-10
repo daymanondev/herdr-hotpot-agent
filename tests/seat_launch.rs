@@ -736,3 +736,45 @@ fn lead_discovery_is_scoped_to_the_project_labels() {
         "this project's lead is launched fresh; no reuse from mismatched labels"
     );
 }
+
+/// AC (ticket 11): a Lead terminal archived by a completed quiet-point
+/// replacement is never a reuse candidate — the successor, not the archived
+/// terminal, is the Project's Lead, so a Lead launch creates a fresh terminal.
+#[test]
+fn lead_launch_never_reuses_an_archived_lead_terminal() {
+    let fixture = LaunchFixture::new("reuse-archived");
+    create_role_home(&fixture, "claude", "lead");
+    let slug = expected_slug(&fixture.repo);
+    script_terminal_list(&fixture, &[("term-old-1", "live", "lead", &slug)]);
+    // The runtime ledger records the quiet-point replacement that archived it.
+    let ledger_dir = fixture
+        .home
+        .path()
+        .join("runtime")
+        .join("v1")
+        .join(&slug);
+    fs::create_dir_all(&ledger_dir).unwrap();
+    fs::write(
+        ledger_dir.join("ledger.jsonl"),
+        "{\"type\":\"lead_archived\",\"replacement\":\"lrep_001\",\"terminal\":\"term-old-1\",\"seq\":1,\"ts\":0}\n",
+    )
+    .unwrap();
+
+    let out = fixture.launch("lead", "claude", &[]);
+    assert!(
+        out.status.success(),
+        "lead launch past an archived lead must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert_eq!(
+        fixture.create_invocations().len(),
+        1,
+        "a fresh successor terminal is created; the archived terminal is not reused"
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("launched"),
+        "stdout reports a launch, not a reuse: {stdout}"
+    );
+}
