@@ -12,10 +12,10 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-echo "==> [1/6] Checking shared protocol.js sync across Herdr mods..."
+echo "==> [1/7] Checking shared protocol.js sync across Herdr mods..."
 ./scripts/sync.sh --check
 
-echo "==> [2/6] Checking JavaScript syntax in shared/ and mods/..."
+echo "==> [2/7] Checking JavaScript syntax in shared/ and mods/..."
 JS_FILES=(
   "shared/protocol.js"
   "mods/hotpot/protocol.js"
@@ -28,13 +28,13 @@ for js in "${JS_FILES[@]}"; do
   echo "  OK: ${js}"
 done
 
-echo "==> [3/6] Running node tests for the shared view-model helpers..."
+echo "==> [3/7] Running node tests for the shared view-model helpers..."
 node --test tests/js/*.test.mjs
 
-echo "==> [4/6] Running node tests (mod view model, keymap, static contract)..."
+echo "==> [4/7] Running node tests (mod view model, keymap, static contract)..."
 node --test 'tests/mods/*.test.mjs'
 
-echo "==> [5/6] Checking JSON manifests (layouts, mod.json, keys.json)..."
+echo "==> [5/7] Checking JSON manifests (layouts, mod.json, keys.json)..."
 JSON_FILES=(
   "layouts/hotpot.json"
   "mods/hotpot/mod.json"
@@ -46,7 +46,10 @@ for jf in "${JSON_FILES[@]}"; do
   echo "  OK: ${jf}"
 done
 
-echo "==> [6/6] Running Rust test suite (cargo test)..."
+echo "==> [6/7] Running Rust test suite (cargo test)..."
 cargo test
+
+echo "==> [7/7] Running Rust lints (cargo clippy --all-targets)..."
+cargo clippy --all-targets
 
 echo "==> All checks passed!"
