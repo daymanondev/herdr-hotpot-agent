@@ -121,6 +121,42 @@ export function attentionView(snapshot) {
   return { quiet: items.length === 0, items };
 }
 
+// The feedback actions the panel's inline Ack / Dismiss buttons deliver:
+// `useful` (the letter earned the Human's attention) and `noisy` (it did not).
+// The CLI maps them onto the runtime's own vocabulary (`src/main.rs:
+// cmd_attention`: `useful` → snooze, `noisy` → mute).
+export const ATTENTION_FEEDBACK_ACTIONS = ["useful", "noisy"];
+
+/** The argv the panel's inline Ack / Dismiss buttons exec:
+ * `hotpot attention feedback <att_id> <useful|noisy>`. Anything but the two
+ * actions — including the runtime's own `mute`/`snooze`/`downrank` vocabulary —
+ * throws before any process is spawned, so the button wiring stays honest. */
+export function attentionFeedbackArgs(key, action) {
+  if (!ATTENTION_FEEDBACK_ACTIONS.includes(action)) {
+    throw new Error(
+      `invalid action \`${action}\`: permitted values are ${ATTENTION_FEEDBACK_ACTIONS.join("|")}`,
+    );
+  }
+  if (typeof key !== "string" || key.trim() === "") {
+    throw new Error(`invalid letter key \`${key}\`: a non-empty att_<id> key is required`);
+  }
+  return ["attention", "feedback", key, action];
+}
+
+/** The seat a letter's row-click selects into the Session Inspector: the peer
+ * holding the letter's assignment when one is live, else the Lead (the
+ * letters' operator-side addressee), else null — a room with no seats selects
+ * nothing. Pure over the `hotpot status` snapshot. */
+export function attentionSeatTarget(letter, snapshot) {
+  const seats = Array.isArray(snapshot?.seats) ? snapshot.seats : [];
+  const assignment = letter?.assignment;
+  if (assignment) {
+    const peer = seats.find((s) => s && s.role === "peer" && s.assignment === assignment);
+    if (peer) return peer;
+  }
+  return seats.find((s) => s && s.role === "lead") ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // Segmented context-bar view model (ticket 13)
 // ---------------------------------------------------------------------------
@@ -557,4 +593,69 @@ export function startSlotSteps(slot, snapshot, project) {
   }
   steps.push({ args: seatLaunchArgs(slot.role, slot.agent, project), timeoutMs: null });
   return steps;
+}
+
+// ---------------------------------------------------------------------------
+// Directive Composer, attention feedback, onboarding chip (ticket nui/07)
+// ---------------------------------------------------------------------------
+
+// The roles the Directive Composer addresses: the Project's two 1:1 seats
+// (GLOSSARY.md: Directive Composer). Peers are dispatched by Lead, never
+// typed at by the Human.
+const COMPOSER_ROLES = ["lead", "supervisor"];
+
+/** The argv the composer's Send execs: `hotpot seat launch <role> --agent
+ * <agent> --project <folder> --prompt <text>` — the CLI (ticket nui/04) that
+ * launches or reuses the target seat and delivers the directive in one step.
+ * The role defaults to `lead`; anything beyond Lead/Supervisor, an unverified
+ * agent family, an empty folder, or empty directive text throws before any
+ * process is spawned. */
+export function directiveDispatchArgs(role, agent, folder, text) {
+  const target = role ?? "lead";
+  if (!COMPOSER_ROLES.includes(target)) {
+    throw new Error(`invalid role \`${role}\`: permitted values are ${COMPOSER_ROLES.join("|")}`);
+  }
+  ensurePillValue(agent, AGENT_OPTIONS, "agent");
+  if (typeof folder !== "string" || folder.trim() === "") {
+    throw new Error(`invalid project \`${folder}\`: a non-empty project folder is required`);
+  }
+  if (typeof text !== "string" || text.trim() === "") {
+    throw new Error("invalid directive: a non-empty directive text is required");
+  }
+  return ["seat", "launch", target, "--agent", agent, "--project", folder, "--prompt", text];
+}
+
+/** The exec sequence one composer Send runs: provision Hotpot Home first when
+ * the snapshot says the Project is not provisioned (GLOSSARY.md: the composer
+ * "automatically provisioning Hotpot Home and launching the target Seat"),
+ * then the launch-then-prompt dispatch. Same step shape as `startSlotSteps`. */
+export function directiveDispatchSteps(snapshot, role, agent, folder, text) {
+  const steps = [];
+  if (snapshot?.provisioned === false) {
+    steps.push({ args: setupApplyArgs(), timeoutMs: SETUP_APPLY_TIMEOUT_MS });
+  }
+  steps.push({ args: directiveDispatchArgs(role, agent, folder, text), timeoutMs: null });
+  return steps;
+}
+
+// The directive the 1-click onboarding chip delivers: run the built-in Lead
+// skill (`src/skills.rs: ONBOARDING_SKILL_NAME`) whose proposal-first body
+// builds an Evidence Map and drafts `WORKSPACE_PROTOCOL.md` only after
+// explicit Human confirmation. A pure constant so the chip is node-testable.
+export const ONBOARDING_DIRECTIVE_TEXT =
+  "Run the hotpot-project-onboarding skill for this repository: build the Evidence Map from its manifests, scripts, tests, and docs, then propose a WORKSPACE_PROTOCOL.md draft — write the file only after my explicit confirmation.";
+
+/** The onboarding chip's visibility model: visible exactly while the snapshot
+ * says the Project root lacks `WORKSPACE_PROTOCOL.md` (`hotpot status`'
+ * `hasWorkspaceProtocol`). A snapshot that predates the flag stays hidden —
+ * the chip never guesses. */
+export function onboardingChipModel(snapshot) {
+  return { visible: snapshot?.hasWorkspaceProtocol === false };
+}
+
+/** The exec sequence the onboarding chip's single click runs: the same
+ * launch-then-prompt dispatch as the composer, targeting Lead with the
+ * onboarding directive (provisioning first when the Project needs it). */
+export function onboardingDispatchSteps(snapshot, agent, folder) {
+  return directiveDispatchSteps(snapshot, "lead", agent, folder, ONBOARDING_DIRECTIVE_TEXT);
 }

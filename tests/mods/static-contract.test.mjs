@@ -120,3 +120,38 @@ test("the panel leaves no text stand-ins for the native markers and bars", () =>
   );
   assert.deepEqual(offenders, [], "no text stand-in survives");
 });
+
+// ---------------------------------------------------------------------------
+// Ticket 07: the panel's three dispatch surfaces at the wiring boundary —
+// inline attention Ack/Dismiss, the bottom Directive Composer, and the
+// onboarding chip — all through `exec("hotpot", ...)` under `cx.spawn`, with
+// busy states and a post-action refresh. The pure decision layer is covered by
+// the node tests over `shared/protocol.js`; this pins that the mod actually
+// wires it.
+// ---------------------------------------------------------------------------
+
+const DISPATCH_SURFACES_REQUIRED = [
+  ["attentionFeedbackArgs(", "the Ack/Dismiss feedback argv builder"],
+  ["attentionSeatTarget(", "the letter row-click seat selection"],
+  ['"useful", "Ack"', "the inline Ack action"],
+  ['"noisy", "Dismiss"', "the inline Dismiss action"],
+  ["directiveDispatchSteps(", "the composer's launch-then-prompt sequence"],
+  ["onboardingChipModel(", "the onboarding chip's visibility gate"],
+  ["onboardingDispatchSteps(", "the onboarding chip's dispatch"],
+  ["InputState.new(cx", "the composer's input state"],
+  ['on("submit"', "Enter submits the composer"],
+  ["cx.spawn(", "dispatches run under cx.spawn, never blocking render"],
+  ["feedbackBusy", "the feedback busy state"],
+  ["composerBusy", "the composer busy state"],
+  ["onboardingBusy", "the onboarding busy state"],
+  ['"Onboard project"', "the 1-click onboarding chip"],
+  ['"Send"', "the composer's Send button"],
+];
+
+test("the panel wires all three dispatch surfaces through exec with busy states", () => {
+  const source = readFileSync(PANEL_SOURCE_URL, "utf8");
+  const missing = DISPATCH_SURFACES_REQUIRED.filter(([needle]) => !source.includes(needle)).map(
+    ([, label]) => label,
+  );
+  assert.deepEqual(missing, [], "every dispatch surface is wired");
+});
