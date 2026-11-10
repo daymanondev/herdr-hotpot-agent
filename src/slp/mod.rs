@@ -3,6 +3,7 @@
 use crate::guard::Role;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub const REQUIRED_CONTRACT_SECTIONS: &[&str] = &[
     "1. Bounded Outcome",
@@ -112,6 +113,17 @@ pub struct MailboxEntry {
     pub summary: String,
 }
 
+/// One seat role's fully resolved default profile: the built-in defaults with
+/// every `<HOTPOT_HOME>/profiles.json` field the role sets layered on top, so
+/// the panel's Seat Slots always carry a concrete configuration (ticket
+/// nui/01).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileStatus {
+    pub agent: String,
+    pub model: String,
+    pub thinking: String,
+}
+
 /// The `hotpot status` projection: the Project's seats, assignment master list,
 /// due Attention Letters, and mailbox, rebuilt from the runtime ledger plus the
 /// live `hc` terminal labels on every call.
@@ -120,6 +132,17 @@ pub struct HotpotStatusSnapshot {
     pub project: String,
     pub workspace: String,
     pub mode: String,
+    /// Whether Hotpot Home has been initialized: the `hotpot.json` setup
+    /// marker is present (ticket nui/01).
+    pub provisioned: bool,
+    /// Whether the Project root carries a `WORKSPACE_PROTOCOL.md` boundary
+    /// document (GLOSSARY.md: WORKSPACE_PROTOCOL; ticket nui/01).
+    #[serde(rename = "hasWorkspaceProtocol")]
+    pub has_workspace_protocol: bool,
+    /// Each seat role's fully resolved default profile — the built-in role
+    /// defaults with the `<HOTPOT_HOME>/profiles.json` entries layered on top
+    /// (ticket nui/01).
+    pub profiles: BTreeMap<String, ProfileStatus>,
     /// The runtime directory under Hotpot Home this projection read
     /// (`<HOTPOT_HOME>/runtime/v1`), when it exists — the path the Herdr mods
     /// subscribe to with `watchFolder` for event-driven refreshes (spec
