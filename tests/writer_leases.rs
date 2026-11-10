@@ -229,3 +229,158 @@ fn read_only_assignment_acquires_no_lease() {
     );
     assert_eq!(exclusive["result"]["lease"]["mode"], "InCheckoutExclusive");
 }
+
+/// A writable worktree-mode `assignment_create` payload with the given scope.
+fn worktree_create(head: &str, write_scope: &[&str], serial_only: &[&str]) -> Value {
+    json!({
+        "outcome": "Ship a scope-disjoint vertical slice",
+        "disposition": "Engineer",
+        "baseCommit": head,
+        "writeScope": write_scope,
+        "serialOnly": serial_only,
+        "gate": "./scripts/check.sh",
+    })
+}
+
+/// Dispatches `assignment` in worktree isolation mode.
+fn dispatch_worktree(mcp: &mut McpProcess, id: &str) -> Value {
+    mcp.tools_call(
+        json!("wt-dispatch"),
+        "assignment_dispatch",
+        json!({"assignment": id, "isolation": "worktree"}),
+    )
+}
+
+#[test]
+fn three_disjoint_worktree_writers_get_real_worktrees_and_a_fourth_hits_the_cap() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+
+    let scopes: [(&[&str], &[&str]); 3] = [
+        (&["src/engine/**"], &["Cargo.lock"]),
+        (&["src/ui/**"], &[]),
+        (&["docs/**"], &[]),
+    ];
+    let mut worktrees = Vec::new();
+    for (scope, serial) in scopes {
+        let id = create_assignment(&mut mcp, worktree_create(&head, scope, serial));
+        let dispatched = dispatch_worktree(&mut mcp, &id);
+        assert!(
+            dispatched.get("error").is_none(),
+            "disjoint worktree dispatch must succeed: {dispatched}"
+        );
+        assert_eq!(dispatched["result"]["state"], "Dispatched");
+        assert_eq!(
+            dispatched["result"]["lease"]["mode"], "IsolatedWorktree",
+            "dispatch result reports the worktree lease mode: {dispatched}"
+        );
+        let worktree = dispatched["result"]["lease"]["worktree"]
+            .as_str()
+            .unwrap_or_else(|| panic!("worktree lease reports its worktree path: {dispatched}"))
+            .to_string();
+        // The worktree lives under <HOTPOT_HOME>/runtime/v1/<project-slug>/worktrees/<asg_id>/.
+        let slug_dir = project_runtime_dir(home.path());
+        let expected_root = slug_dir.join("worktrees").join(&id);
+        assert_eq!(
+            std::path::Path::new(&worktree),
+            expected_root,
+            "worktree path follows the spec layout"
+        );
+        assert!(
+            std::path::Path::new(&worktree).is_dir(),
+            "the worktree is materialized on disk: {worktree}"
+        );
+        assert_eq!(
+            git(std::path::Path::new(&worktree), &["rev-parse", "HEAD"]),
+            head,
+            "worktree HEAD equals the assignment baseCommit"
+        );
+        worktrees.push(worktree);
+    }
+    assert_eq!(
+        ledger_events_of_type(home.path(), "writer_lease_acquired").len(),
+        3
+    );
+
+    // A fourth worktree writer is refused at the lease cap.
+    let fourth = create_assignment(&mut mcp, worktree_create(&head, &["tools/**"], &[]));
+    let refused = dispatch_worktree(&mut mcp, &fourth);
+    let message = error_message(&refused);
+    assert!(
+        message.contains("lease_cap"),
+        "fourth concurrent worktree writer hits the cap: {message}"
+    );
+    let slug_dir = project_runtime_dir(home.path());
+    assert!(
+        !slug_dir.join("worktrees").join(&fourth).exists(),
+        "the refused dispatch provisions no worktree"
+    );
+}
+
+/// The per-project runtime dir holding the ledger (`<home>/runtime/v1/<slug>`).
+fn project_runtime_dir(home: &Path) -> std::path::PathBuf {
+    common::ledger_path(home)
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+#[test]
+fn worktree_scope_overlap_and_serial_path_are_refused() {
+    let home = TempDir::new("home");
+    let (repo, head) = init_git_repo();
+    let mut mcp = McpProcess::spawn("lead", repo.path(), home.path());
+
+    // Active lease A writes under src/engine/**.
+    let engine = create_assignment(&mut mcp, worktree_create(&head, &["src/engine/**"], &[]));
+    let dispatched = dispatch_worktree(&mut mcp, &engine);
+    assert!(dispatched.get("error").is_none(), "{dispatched}");
+
+    // A Write Scope overlapping lease A's Write Scope is refused with scope_overlap.
+    let overlapping = create_assignment(&mut mcp, worktree_create(&head, &["src/**"], &[]));
+    let refused = dispatch_worktree(&mut mcp, &overlapping);
+    let message = error_message(&refused);
+    assert!(
+        message.contains("scope_overlap") && message.contains("src/**"),
+        "overlapping scope refusal names the colliding path: {message}"
+    );
+
+    // Active lease B serializes Cargo.lock (write scope pkg-a/**, serialOnly Cargo.lock).
+    let serializer = create_assignment(
+        &mut mcp,
+        worktree_create(&head, &["pkg-a/**"], &["Cargo.lock"]),
+    );
+    let dispatched = dispatch_worktree(&mut mcp, &serializer);
+    assert!(dispatched.get("error").is_none(), "{dispatched}");
+
+    // A peer whose declared path is inside lease B's serialOnly is refused
+    // with serial_path.
+    let into_serial = create_assignment(&mut mcp, worktree_create(&head, &["Cargo.lock"], &[]));
+    let refused = dispatch_worktree(&mut mcp, &into_serial);
+    let message = error_message(&refused);
+    assert!(
+        message.contains("serial_path") && message.contains("Cargo.lock"),
+        "serial-only path refusal names the path: {message}"
+    );
+
+    // A genuinely disjoint peer is still accepted while both leases are held.
+    let disjoint = create_assignment(&mut mcp, worktree_create(&head, &["pkg-b/**"], &[]));
+    let ok = dispatch_worktree(&mut mcp, &disjoint);
+    assert!(ok.get("error").is_none(), "disjoint peer dispatches: {ok}");
+
+    assert_eq!(
+        ledger_events_of_type(home.path(), "writer_lease_acquired").len(),
+        3,
+        "only the three accepted worktree leases exist"
+    );
+    for refused_id in [&overlapping, &into_serial] {
+        assert!(
+            !project_runtime_dir(home.path())
+                .join("worktrees")
+                .join(refused_id)
+                .exists(),
+            "refused dispatch `{refused_id}` provisions no worktree"
+        );
+    }
+}

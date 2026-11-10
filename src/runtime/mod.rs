@@ -736,17 +736,65 @@ fn assignment_dispatch(
     // Writability is declared by a non-empty Write Scope: read-only assignments
     // (e.g. a Reviewer) acquire no Writer Lease and never touch the checkout.
     let writable = !asg.write_scope.is_empty();
+    let isolation = leases::parse_isolation(args)?;
     let state = RuntimeState::load(ledger);
+    let mut provision: Option<leases::WorktreeProvision> = None;
     if writable {
-        // The exclusive checkout lease blocks writes from all other seats —
-        // including Lead itself — until it is released (spec user story 20).
-        if let Some(holder) = state.active_leases().first() {
-            return Err(RpcError::invalid_params(format!(
-                "{TOOL}: writer_exclusive: the checkout writer lease is held by `{}` (mode `{}`); writable dispatch is refused for all seats (including Lead) until the lease is released",
-                holder.assignment, holder.mode
-            )));
+        match isolation {
+            leases::Isolation::Checkout => {
+                // The exclusive checkout lease blocks writes from all other
+                // seats — including Lead itself — until it is released (spec
+                // user story 20).
+                if let Some(holder) = state.active_leases().first() {
+                    return Err(RpcError::invalid_params(format!(
+                        "{TOOL}: writer_exclusive: the checkout writer lease is held by `{}` (mode `{}`); writable dispatch is refused for all seats (including Lead) until the lease is released",
+                        holder.assignment, holder.mode
+                    )));
+                }
+                leases::verify_checkout_preconditions(project_root, &asg.base_commit)?;
+            }
+            leases::Isolation::Worktree => {
+                // Isolated worktree writers: at most LEASE_CAP concurrent, with
+                // pairwise-disjoint Write Scope and serialOnly globs against the
+                // active worktree leases (spec user story 21).
+                let peers: Vec<(String, Vec<String>, Vec<String>)> = state
+                    .active_leases()
+                    .iter()
+                    .filter(|l| l.mode == leases::ISOLATED_WORKTREE)
+                    .map(|l| {
+                        let peer = state.assignment(&l.assignment);
+                        (
+                            l.assignment.clone(),
+                            peer.map(|a| a.write_scope.clone()).unwrap_or_default(),
+                            peer.map(|a| a.serial_only.clone()).unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                if peers.len() >= leases::LEASE_CAP {
+                    let holders = peers
+                        .iter()
+                        .map(|(id, ..)| format!("`{id}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(RpcError::invalid_params(format!(
+                        "{TOOL}: lease_cap: the isolated worktree lease cap of {} concurrent writers is reached (held by {holders}); release a lease before dispatching another isolated writer",
+                        leases::LEASE_CAP
+                    )));
+                }
+                leases::check_scope_disjointness(
+                    TOOL,
+                    &asg.write_scope,
+                    &asg.serial_only,
+                    &peers,
+                )?;
+                provision = Some(leases::provision_worktree(
+                    project_root,
+                    ledger.project_dir(),
+                    &id,
+                    &asg.base_commit,
+                )?);
+            }
         }
-        leases::verify_checkout_preconditions(project_root, &asg.base_commit)?;
     }
 
     // The correlation -> (project, assignment, workspace) binding is what the peer
@@ -763,17 +811,22 @@ fn assignment_dispatch(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("corr_{ordinal:03}"));
-    let workspace = args
-        .get("workspace")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            std::fs::canonicalize(project_root)
-                .unwrap_or_else(|_| project_root.to_path_buf())
-                .to_string_lossy()
-                .to_string()
-        });
+    // An isolated writer's workspace is its provisioned worktree; every other
+    // dispatch works in the project checkout.
+    let workspace = match &provision {
+        Some(p) => p.worktree.to_string_lossy().to_string(),
+        None => args
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                std::fs::canonicalize(project_root)
+                    .unwrap_or_else(|_| project_root.to_path_buf())
+                    .to_string_lossy()
+                    .to_string()
+            }),
+    };
 
     ledger
         .append(json!({
@@ -784,14 +837,24 @@ fn assignment_dispatch(
         }))
         .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
     if writable {
-        ledger
-            .append(leases::lease_acquired_event(
+        let event = match &provision {
+            Some(p) => leases::lease_acquired_event(
+                &id,
+                leases::ISOLATED_WORKTREE,
+                Some(&p.worktree),
+                Some(&p.cargo_target_dir),
+                &p.worktree_include,
+            ),
+            None => leases::lease_acquired_event(
                 &id,
                 leases::IN_CHECKOUT_EXCLUSIVE,
                 None,
                 None,
                 &[],
-            ))
+            ),
+        };
+        ledger
+            .append(event)
             .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
     }
 

@@ -136,6 +136,14 @@ impl Ledger {
         &self.path
     }
 
+    /// The per-project runtime dir (`<state>/runtime/v1/<slug>`) hosting the
+    /// ledger, isolated worktrees, and the shared warm-build cache.
+    pub fn project_dir(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("ledger path always sits inside its project dir")
+    }
+
     /// Reads every parsable event line, in file order. Unparsable lines (e.g. a
     /// torn final write after a crash) are skipped rather than fatal.
     pub fn read_events(&self) -> Vec<Value> {
