@@ -231,7 +231,17 @@ export default class HotpotPanel extends View {
       try {
         for (const step of steps) {
           try {
-            await exec("hotpot", step.args, hotpotExecOptions(sp, folder, step.timeoutMs ?? 5000));
+            const res = await exec(
+              "hotpot",
+              step.args,
+              hotpotExecOptions(sp, folder, step.timeoutMs ?? 5000),
+            );
+            // exec resolves (not rejects) on a non-zero exit: check it like
+            // runDispatchSteps does, or a failed `setup --apply` would roll on
+            // into the seat-launch step and fail there too.
+            if (res.code !== 0) {
+              throw new Error((res.stderr || res.stdout || "hotpot exited").trim());
+            }
           } catch {
             // stop at the first failed step; the refresh below shows reality
             break;
