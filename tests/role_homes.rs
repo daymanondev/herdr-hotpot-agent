@@ -512,15 +512,14 @@ fn hotpot_json_digest_is_deterministic_and_tweak_sensitive() {
     let contracts_dir = TempDir::new("contracts");
     fs::write(
         contracts_dir.path().join("peer.md"),
-        "## role-peer\n\nTweaked peer body: escalated challenge discipline for this test.\n"
-            .to_string(),
+        "## role-peer\n\nTweaked peer body: escalated challenge discipline for this test.\n",
     )
     .unwrap();
     let tweaked = TempDir::new("dig3");
     run_setup_apply(
         tweaked.path(),
         fake_home.path(),
-        &[("HOTPOT_CONTRACTS_DIR", &contracts_dir.path().to_string_lossy().into_owned())],
+        &[("HOTPOT_CONTRACTS_DIR", &contracts_dir.path().to_string_lossy())],
     );
     let digest_tweaked = marker_digest(tweaked.path());
     assert_ne!(
@@ -603,4 +602,211 @@ fn authentication_md_lists_one_login_command_per_seat_without_secrets() {
             "AUTHENTICATION.md must not leak credential contents"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance criteria 6 & 7: `hotpot auth login` scoped vendor launch and
+// invalid-seat diagnostics.
+// ---------------------------------------------------------------------------
+
+/// Writes a fake vendor binary that appends its argv, cwd, and sorted environment to `log`,
+/// drops a marker file under its `$HOME`, and exits `status`.
+fn write_fake_vendor(bin_dir: &Path, name: &str, log: &Path, status: i32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(bin_dir).unwrap();
+    let script = format!(
+        "#!/bin/sh\n\
+         {{\n\
+         \x20 printf 'argv: %s\\n' \"$*\"\n\
+         \x20 printf 'cwd: %s\\n' \"$(pwd)\"\n\
+         \x20 env | LC_ALL=C sort\n\
+         }} >> {log}\n\
+         mkdir -p \"$HOME/.seat-login-marker\"\n\
+         printf 'marker\\n' > \"$HOME/.seat-login-marker/marker.txt\"\n\
+         exit {status}\n",
+        log = log.display(),
+        status = status,
+    );
+    let shim = bin_dir.join(name);
+    fs::write(&shim, script).unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn auth_login_scopes_the_vendor_process_to_exactly_one_role_home() {
+    let home = TempDir::new("login");
+    let fake_home = TempDir::new("fakehome");
+    let sentinels = plant_operator_sentinels(fake_home.path());
+    let bin = TempDir::new("bin");
+    let log_dir = TempDir::new("loginlog");
+    let log = log_dir.path().join("pi-login.log");
+    write_fake_vendor(bin.path(), "pi", &log, 0);
+    run_setup_apply(home.path(), fake_home.path(), &[]);
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        Some(bin.path()),
+        &[],
+        &["auth", "login", "pi", "peer"],
+    );
+    assert!(
+        out.status.success(),
+        "auth login pi peer must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+
+    let recorded = fs::read_to_string(&log).expect("fake pi binary must have been invoked");
+    let role_home = home.path().join("roles/pi/peer");
+    // `pwd` in the shim reports the physical path (/private/var/... on macOS), so compare
+    // against the canonicalized Role Home spelling.
+    let role_home_physical = fs::canonicalize(&role_home).unwrap_or_else(|_| role_home.clone());
+    assert!(
+        recorded.contains(&"argv: login".to_string()),
+        "the vendor binary must be invoked as `login`:\n{recorded}"
+    );
+    assert!(
+        recorded.contains(&format!("cwd: {}", role_home_physical.display())),
+        "the vendor process must run with cwd scoped to the Role Home:\n{recorded}"
+    );
+    assert!(
+        recorded.contains(&format!("HOME={}", role_home.display())),
+        "the vendor process must see HOME scoped to the Role Home:\n{recorded}"
+    );
+
+    // The fake wrote its marker under its $HOME — proving that $HOME really was the Role Home.
+    let marker = role_home.join(".seat-login-marker/marker.txt");
+    assert!(
+        marker.exists(),
+        "the fake vendor's $HOME marker must land inside the Role Home: {}",
+        marker.display()
+    );
+
+    // No operator-home paths anywhere in the recorded environment.
+    for line in recorded.lines() {
+        assert!(
+            !line.contains(fake_home.path().to_string_lossy().as_ref()),
+            "recorded vendor environment must contain no operator-home paths: {line}"
+        );
+    }
+
+    // Exactly one seat is affected: no other Role Home received a marker.
+    for (agent, role) in seats() {
+        if (agent, role) != ("pi", "peer") {
+            assert!(
+                !home
+                    .path()
+                    .join(format!("roles/{agent}/{role}/.seat-login-marker"))
+                    .exists(),
+                "auth login must not touch the {agent}/{role} seat"
+            );
+        }
+    }
+    assert_operator_sentinels_unchanged(&sentinels);
+}
+
+#[test]
+fn auth_login_propagates_vendor_failure_exit_status() {
+    let home = TempDir::new("loginfail");
+    let fake_home = TempDir::new("fakehome");
+    let bin = TempDir::new("bin");
+    let log_dir = TempDir::new("loginfaillog");
+    write_fake_vendor(bin.path(), "codex", &log_dir.path().join("codex-login.log"), 3);
+    run_setup_apply(home.path(), fake_home.path(), &[]);
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        Some(bin.path()),
+        &[],
+        &["auth", "login", "codex", "supervisor"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a failing vendor login must surface its exit status"
+    );
+}
+
+#[test]
+fn auth_login_rejects_invalid_role_and_agent_on_stderr() {
+    let home = TempDir::new("loginbad");
+    let fake_home = TempDir::new("fakehome");
+    run_setup_apply(home.path(), fake_home.path(), &[]);
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        None,
+        &[],
+        &["auth", "login", "codex", "wizard"],
+    );
+    assert!(
+        !out.status.success(),
+        "an invalid role must exit non-zero"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("wizard"),
+        "the diagnostic must name the invalid role:\n{stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("role"),
+        "the diagnostic must say what was invalid:\n{stderr}"
+    );
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        None,
+        &[],
+        &["auth", "login", "sonnet", "lead"],
+    );
+    assert!(
+        !out.status.success(),
+        "an invalid agent must exit non-zero"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("sonnet"),
+        "the diagnostic must name the invalid agent:\n{stderr}"
+    );
+}
+
+#[test]
+fn auth_login_fails_closed_when_the_seat_or_vendor_is_missing() {
+    let home = TempDir::new("loginmiss");
+    let fake_home = TempDir::new("fakehome");
+
+    // No setup --apply first: the Role Home does not exist yet.
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        None,
+        &[],
+        &["auth", "login", "pi", "peer"],
+    );
+    assert!(!out.status.success(), "login into an unprovisioned seat must fail");
+    assert!(
+        stderr_of(&out).to_lowercase().contains("setup"),
+        "the diagnostic must point at `hotpot setup --apply`:\n{}",
+        stderr_of(&out)
+    );
+
+    // Provisioned home, but no vendor binary on PATH.
+    run_setup_apply(home.path(), fake_home.path(), &[]);
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        None,
+        &[],
+        &["auth", "login", "pi", "peer"],
+    );
+    assert!(!out.status.success(), "login without the vendor CLI must fail");
+    assert!(
+        stderr_of(&out).contains("pi"),
+        "the diagnostic must name the missing vendor binary:\n{}",
+        stderr_of(&out)
+    );
 }
