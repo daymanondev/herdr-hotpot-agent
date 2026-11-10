@@ -297,3 +297,91 @@ export function ptyTarget(seat) {
   const address = typeof seat === "object" && seat !== null ? seat.terminal : null;
   return typeof address === "string" && address.trim() !== "" ? address : null;
 }
+
+// ---------------------------------------------------------------------------
+// Seat Slot view model (ticket nui/01)
+// ---------------------------------------------------------------------------
+
+// The 1:1 seat roles whose slots the panel always renders (GLOSSARY.md:
+// Seat Slot) — launched with live seat data, or unlaunched with the role's
+// resolved profile defaults from `hotpot status`'s `profiles`.
+const SLOT_ROLES = ["supervisor", "lead"];
+
+const SLOT_TITLES = { supervisor: "Supervisor", lead: "Lead" };
+
+function pick(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return null;
+}
+
+/** One always-present Seat Slot: `launched` with the live seat data when a
+ * seat of this role is running, else `status: "unlaunched"` carrying the
+ * role's `snapshot.profiles` defaults. Live seat values win per field; the
+ * profile defaults (then null) fill every field the seat leaves unset. */
+function seatSlot(role, snapshot) {
+  const seat = Array.isArray(snapshot?.seats)
+    ? snapshot.seats.find((s) => s && s.role === role) ?? null
+    : null;
+  const profile = snapshot?.profiles?.[role] ?? {};
+  const fields = {
+    agent: pick(seat?.agent, profile.agent),
+    model: pick(seat?.model, profile.model),
+    thinking: pick(seat?.thinking, profile.thinking),
+    terminal: pick(seat?.terminal),
+  };
+  return {
+    role,
+    title: SLOT_TITLES[role],
+    launched: Boolean(seat),
+    status: seat ? pick(seat.status, "offline") : "unlaunched",
+    ...fields,
+    seat,
+  };
+}
+
+/** The child Peer rows attached under Lead: every peer seat joined with its
+ * assignment record (matched by assignment id) so each row carries the
+ * assignment, disposition, gate verdict, attempt, and terminal alongside the
+ * seat's own agent/model/thinking/status. */
+function peerRows(snapshot) {
+  const seats = Array.isArray(snapshot?.seats) ? snapshot.seats : [];
+  const tasks = Array.isArray(snapshot?.tasks) ? snapshot.tasks : [];
+  return seats
+    .filter((s) => s && s.role === "peer")
+    .map((seat) => {
+      const assignment = seat.assignment ?? null;
+      const task = assignment
+        ? (tasks.find((t) => t && t.id === assignment) ?? null)
+        : null;
+      return {
+        id: seat.id ?? null,
+        role: "peer",
+        assignment,
+        disposition: task?.disposition ?? null,
+        gate: task?.verdict ?? null,
+        attempt: task?.attempt ?? null,
+        terminal: pick(seat.terminal, task?.terminal),
+        agent: seat.agent ?? null,
+        model: seat.model ?? null,
+        thinking: seat.thinking ?? null,
+        status: seat.status ?? null,
+        seat,
+      };
+    });
+}
+
+/** The panel's Seat Slot model over one `hotpot status` snapshot: the
+ * always-present Supervisor and Lead slots (launched with live seat data or
+ * unlaunched with the role's profile defaults) plus the child Peer rows
+ * attached under Lead. Pure and total: a null or partial snapshot still yields
+ * the full model shape with unlaunched slots and no peers. */
+export function seatSlotsModel(snapshot) {
+  const model = {};
+  for (const role of SLOT_ROLES) {
+    model[role] = seatSlot(role, snapshot);
+  }
+  model.lead.peers = peerRows(snapshot);
+  return model;
+}
