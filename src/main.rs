@@ -1,10 +1,12 @@
 pub mod guard;
 pub mod hc;
 pub mod inspector;
+pub mod provisioner;
 pub mod slp;
 
 use guard::{Role, evaluate_pre_tool_hook};
 use inspector::{SessionInspection, TranscriptItem};
+use provisioner::{PlanError, base_home_plan, find_on_path, resolve_hotpot_home};
 use serde_json::{Value, json};
 use slp::{HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus, role_scoped_mcp_tools};
 use std::env;
@@ -284,6 +286,25 @@ fn cmd_mcp(args: &[String]) {
     }
 }
 
+/// `hotpot setup [--apply]`: dry-run desired-state planning over Hotpot Home by default;
+/// `--apply` materializes exactly the planned set.
+fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
+    let apply = args.iter().any(|a| a == "--apply");
+    let home = resolve_hotpot_home()?;
+    let hc_available = find_on_path("hc").is_some();
+    let plan = base_home_plan(&home, hc_available);
+    plan.validate()?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if !apply {
+        plan.print_dry_run(&mut out)
+            .map_err(|e| PlanError::new("io", format!("failed to print dry-run plan: {e}")))?;
+        return Ok(());
+    }
+    plan.apply(&mut out)
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let sub = args.get(1).map(String::as_str).unwrap_or("status");
@@ -292,9 +313,15 @@ fn main() {
         "inspect" => cmd_inspect(&args[2..]),
         "hook" => cmd_hook(&args[2..]),
         "mcp" => cmd_mcp(&args[2..]),
+        "setup" => {
+            if let Err(err) = cmd_setup(&args[2..]) {
+                eprintln!("hotpot: {err}");
+                std::process::exit(1);
+            }
+        }
         "--help" | "-h" | "help" => {
             println!("hotpot 0.1.0 — Rust SLP verification engine & session inspector for Herdr");
-            println!("Commands: status, inspect, hook, mcp");
+            println!("Commands: status, inspect, hook, mcp, setup [--apply], remove [--apply]");
         }
         _ => cmd_status(&args[1..]),
     }
