@@ -1,8 +1,12 @@
 import { View, div, TextView } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, hc, spaces, theme, run, shared, home, nextCommand, notify } from "herdr";
+import { exec, hc, spaces, theme, run, shared, home, nextCommand, notify, watchFolder } from "herdr";
 import {
   HOTPOT_SELECTED_KEY,
+  activeSpace,
+  spaceFolder,
+  hotpotExecOptions,
+  parentDir,
   formatContextBadge,
   statusColor,
   parseHotpotJson,
@@ -21,8 +25,16 @@ export default class HotpotSessionInspector extends View {
     this.collapsed = {};
     this.lastAgentId = null;
     this.loading = false;
+    // The transcript directory currently subscribed via `watchFolder` (null
+    // until an inspection names a transcript, after a seat switch, or when a
+    // watch is rejected).
+    this.watchedDir = null;
     this.promptInput = InputState.new(cx, { placeholder: "Send directive or message to this session..." });
-    cx.timer.every(1500, (timerCx) => this.refresh(timerCx));
+    // Fallback cadence only: transcript writes stream in through
+    // `watchTranscript` (`watchFolder` on the session directory the
+    // architecture doc prescribes). The timer covers selection changes,
+    // seats whose transcript appears later, and a refused watch.
+    cx.timer.every(3000, (timerCx) => this.refresh(timerCx));
     // Key handling for the `Alt+T` Raw PTY jump: `keys.json` binds
     // `alt-t` to `hotpot-session:pty-focus`, delivered here.
     cx.spawn(async (taskCx) => {
@@ -36,22 +48,19 @@ export default class HotpotSessionInspector extends View {
     this.refresh(cx);
   }
 
-  activeSpace() {
-    const all = spaces();
-    return all.find((s) => s.active) ?? all[0] ?? null;
-  }
-
   refresh(cx) {
     const selected = shared(HOTPOT_SELECTED_KEY);
-    if (!selected || this.loading) return;
+    // A selection without a real seat id has nothing to inspect — no
+    // fabricated fallback id reaches the engine.
+    if (!selected?.id || this.loading) return;
     // A new seat selection starts from a clean transcript and default expansion.
     if (selected.id !== this.lastAgentId) {
       this.lastAgentId = selected.id;
       this.collapsed = {};
       this.items = [];
     }
-    const sp = this.activeSpace();
-    const folder = sp?.folder || home();
+    const sp = activeSpace(spaces());
+    const folder = spaceFolder(sp, home());
     this.loading = true;
 
     cx.spawn(async (taskCx) => {
@@ -61,22 +70,21 @@ export default class HotpotSessionInspector extends View {
           "--workspace",
           folder,
           "--agent",
-          selected.id || "seat-lead",
+          selected.id,
+          // `--role` is accepted and ignored by the engine (the seat resolves
+          // by correlation id); sent for CLI readability only.
           "--role",
           selected.role || "lead",
         ];
         if (selected.terminal) {
           args.push("--terminal", selected.terminal);
         }
-        const res = await exec("hotpot", args, {
-          cwd: folder,
-          on: sp?.machine ?? null,
-          timeout: 5000,
-        });
+        const res = await exec("hotpot", args, hotpotExecOptions(sp, folder));
         if (res.code === 0) {
           const parsed = parseHotpotJson(res.stdout, null);
           if (parsed && Array.isArray(parsed.items)) {
             this.items = parsed.items;
+            this.watchTranscript(parentDir(parsed.transcript), taskCx);
           }
         }
       } catch {
@@ -84,6 +92,30 @@ export default class HotpotSessionInspector extends View {
       } finally {
         this.loading = false;
         taskCx.notify();
+      }
+    });
+  }
+
+  // The event-driven half of the inspector's data channel: once an inspection
+  // names the transcript file it parsed, subscribe to the session directory
+  // holding it with Herdr's native `watchFolder` and re-inspect on every
+  // change batch — new transcript lines reach the view as they land. A seat
+  // switch replaces the subscription; a rejected watch re-arms on the next
+  // inspection that finds a transcript.
+  watchTranscript(dir, cx) {
+    if (this.watchedDir === dir) return;
+    // Assigning null (a seat without a transcript yet) retires any prior
+    // subscription: its loop exits at the next iteration.
+    this.watchedDir = dir ?? null;
+    if (!dir) return;
+    cx.spawn(async (watchCx) => {
+      try {
+        while (this.watchedDir === dir) {
+          await watchFolder(dir);
+          if (this.watchedDir === dir) this.refresh(watchCx);
+        }
+      } catch {
+        this.watchedDir = null;
       }
     });
   }
@@ -239,15 +271,10 @@ export default class HotpotSessionInspector extends View {
 
   render(cx) {
     const t = theme();
-    const selected = shared(HOTPOT_SELECTED_KEY) ?? {
-      id: "seat-lead",
-      role: "lead",
-      title: "Lead",
-      provider: "codex",
-      model: "gpt-5.4",
-      status: "idle",
-      context_tokens: 42100,
-    };
+    // No default seat: with nothing selected the header stays real — a
+    // "no seat selected" hint instead of a fabricated Lead/model/context
+    // (spec Slice 3: replace mocked data with real runtime state).
+    const selected = shared(HOTPOT_SELECTED_KEY) ?? null;
     const seatActive = isSeatActive(selected);
     const target = ptyTarget(selected);
 
@@ -275,22 +302,33 @@ export default class HotpotSessionInspector extends View {
                   .text_size(14)
                   .font_semibold()
                   .text_color(t.foreground)
-                  .child(`👁 ${selected.title || "Session Inspector"}`),
-                div()
-                  .px(6)
-                  .rounded(4)
-                  .bg(t.raised)
-                  .text_size(11)
-                  .text_color(t.muted)
-                  .child(`${selected.provider || "claude"}/${selected.model || "opus"}`),
-                div()
-                  .px(6)
-                  .rounded(4)
-                  .bg(t.surface)
-                  .text_size(11)
-                  .text_color(t.accent)
-                  .child(formatContextBadge(selected.context_tokens ?? 0, selected.role)),
-              ]),
+                  .child(`👁 ${selected?.title || "Session Inspector"}`),
+                selected
+                  ? div()
+                      .px(6)
+                      .rounded(4)
+                      .bg(t.raised)
+                      .text_size(11)
+                      .text_color(t.muted)
+                      .child(`${selected.provider || "–"}/${selected.model || "–"}`)
+                  : div()
+                      .id("header-no-seat")
+                      .px(6)
+                      .rounded(4)
+                      .bg(t.raised)
+                      .text_size(11)
+                      .text_color(t.dim)
+                      .child("no seat selected"),
+                selected
+                  ? div()
+                      .px(6)
+                      .rounded(4)
+                      .bg(t.surface)
+                      .text_size(11)
+                      .text_color(t.accent)
+                      .child(formatContextBadge(selected.context_tokens ?? 0, selected.role))
+                  : null,
+              ].filter(Boolean)),
             target
               ? div()
                   .id("btn-switch-pty")

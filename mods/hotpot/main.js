@@ -7,11 +7,13 @@
 // named preset profiles persisting through `hotpot profile set`, and the
 // assignment master–detail list selecting into the Session Inspector via the
 // shared-key flow. Everything renders over the live `hotpot status` snapshot
-// (ticket 12) — empty state stays empty, never mocked.
+// (ticket 12) — empty state stays empty, never mocked. Ledger changes stream
+// in through `watchFolder` on the runtime root the snapshot names (`runtimeDir`),
+// with a slow timer fallback for changes that have no file event.
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { exec, spaces, theme, run, shared, setShared, home } from "herdr";
+import { exec, spaces, theme, run, shared, setShared, home, watchFolder } from "herdr";
 import {
   HOTPOT_SELECTED_KEY,
   HOTPOT_VIEW_MODE_KEY,
@@ -21,6 +23,9 @@ import {
   THINKING_OPTIONS,
   PRESET_NAMES,
   PRESET_PROFILES,
+  activeSpace,
+  spaceFolder,
+  hotpotExecOptions,
   attentionView,
   contextBarModel,
   formatTokenCount,
@@ -55,41 +60,68 @@ export default class HotpotPanel extends View {
     this.snapshot = null;
     this.lastFolder = null;
     this.loading = false;
+    // The runtime directory currently subscribed via `watchFolder` (null until
+    // a snapshot names one, or after a rejected watch re-arms it).
+    this.watchedDir = null;
     // The seat whose inline pill picker is open, plus its draft selection.
     this.pickerFor = null;
     this.picker = null;
     this.presetBusy = false;
-    cx.timer.every(2500, (timerCx) => this.refresh(timerCx));
+    // Fallback cadence only: ledger changes stream in through `watchRuntime`
+    // (`watchFolder` on Hotpot Home's runtime root, spec "Implementation
+    // Decisions"; ADR 0001). The timer covers what has no file event — `hc`
+    // terminal status flips and attention letters that fall due by time —
+    // and keeps the panel alive if the platform refuses the watch.
+    cx.timer.every(10000, (timerCx) => this.refresh(timerCx));
     this.refresh(cx);
   }
 
-  activeSpace() {
-    const all = spaces();
-    return all.find((s) => s.active) ?? all[0] ?? null;
-  }
-
   refresh(cx) {
-    const sp = this.activeSpace();
-    const folder = sp?.folder || home();
+    const sp = activeSpace(spaces());
+    const folder = spaceFolder(sp, home());
     if (this.loading && this.lastFolder === folder) return;
     this.loading = true;
     this.lastFolder = folder;
 
     cx.spawn(async (taskCx) => {
       try {
-        const res = await exec("hotpot", ["status", "--workspace", folder], {
-          cwd: folder,
-          on: sp?.machine ?? null,
-          timeout: 5000,
-        });
+        const res = await exec(
+          "hotpot",
+          ["status", "--workspace", folder],
+          hotpotExecOptions(sp, folder),
+        );
         if (res.code === 0) {
           this.snapshot = parseHotpotJson(res.stdout, null);
+          this.watchRuntime(this.snapshot?.runtimeDir ?? null, taskCx);
         }
       } catch {
         // Keep last good snapshot; an unreachable engine renders quiet state
       } finally {
         this.loading = false;
         taskCx.notify();
+      }
+    });
+  }
+
+  // The event-driven half of the mod↔engine channel: once a status snapshot
+  // names the runtime root under Hotpot Home, subscribe to it with Herdr's
+  // native `watchFolder` and re-run `hotpot status` on every change batch.
+  // A new directory replaces the subscription; a rejected watch (e.g. the
+  // platform refusing it) re-arms on the next snapshot that names one.
+  watchRuntime(dir, cx) {
+    if (this.watchedDir === dir) return;
+    // Assigning null (runtime state removed from Hotpot Home) retires any
+    // prior subscription: its loop exits at the next iteration.
+    this.watchedDir = dir ?? null;
+    if (!dir) return;
+    cx.spawn(async (watchCx) => {
+      try {
+        while (this.watchedDir === dir) {
+          await watchFolder(dir);
+          if (this.watchedDir === dir) this.refresh(watchCx);
+        }
+      } catch {
+        this.watchedDir = null;
       }
     });
   }
@@ -104,15 +136,11 @@ export default class HotpotPanel extends View {
     } catch {
       return;
     }
-    const sp = this.activeSpace();
-    const folder = sp?.folder || home();
+    const sp = activeSpace(spaces());
+    const folder = spaceFolder(sp, home());
     cx.spawn(async (taskCx) => {
       try {
-        await exec("hotpot", args, {
-          cwd: folder,
-          on: sp?.machine ?? null,
-          timeout: 5000,
-        });
+        await exec("hotpot", args, hotpotExecOptions(sp, folder));
       } catch {
         // a failed write stays visible through the next status refresh
       } finally {
@@ -126,19 +154,19 @@ export default class HotpotPanel extends View {
     const preset = PRESET_PROFILES[name];
     if (!preset || this.presetBusy) return;
     this.presetBusy = true;
-    const sp = this.activeSpace();
-    const folder = sp?.folder || home();
+    const sp = activeSpace(spaces());
+    const folder = spaceFolder(sp, home());
     cx.spawn(async (taskCx) => {
       try {
         for (const role of PROFILE_ROLES) {
           const payload = preset[role];
           if (!payload) continue;
           try {
-            await exec("hotpot", profileSetArgs(payload.agent, role, payload.model, payload.thinking), {
-              cwd: folder,
-              on: sp?.machine ?? null,
-              timeout: 5000,
-            });
+            await exec(
+              "hotpot",
+              profileSetArgs(payload.agent, role, payload.model, payload.thinking),
+              hotpotExecOptions(sp, folder),
+            );
           } catch {
             // keep applying the remaining roles; status refresh shows reality
           }
@@ -532,8 +560,10 @@ export default class HotpotPanel extends View {
             role: "peer",
             task: task.id,
             title: `Peer · ${task.id}`,
-            provider: task.agent || "claude",
-            model: task.model || "sonnet",
+            // Real dispatch-record values only — the inspector renders missing
+            // ones as `–` rather than a mocked provider/model.
+            provider: task.agent || null,
+            model: task.model || null,
             terminal: task.terminal || null,
             status: task.state || "idle",
             context_tokens: task.context_tokens || 0,
@@ -582,7 +612,7 @@ export default class HotpotPanel extends View {
 
   render(cx) {
     const t = theme();
-    const sp = this.activeSpace();
+    const sp = activeSpace(spaces());
     const selected = shared(HOTPOT_SELECTED_KEY);
     const selectedId = selected?.id ?? null;
 

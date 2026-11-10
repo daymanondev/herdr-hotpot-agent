@@ -41,7 +41,7 @@ Left to right, building on Herdr's default `main` layout:
 ## Watch out
 
 - Install with `./scripts/install.sh` (or `./scripts/install.sh --root <scratch>` for testing) so the `hotpot` Rust binary is compiled and linked into `~/.local/bin/hotpot` and shared JS modules are synced into `mods/`.
-- `mods/hotpot` and `mods/hotpot-session` invoke `exec("hotpot", ...)` and `hc(...)` and watch `<stateDir>/projects/` via `watchFolder`.
+- `mods/hotpot` and `mods/hotpot-session` invoke `exec("hotpot", ...)` and `hc(...)`; the panel watches `<HOTPOT_HOME>/runtime/v1/` (served by `hotpot status` as `runtimeDir`) and the inspector watches the selected seat's session directory via `watchFolder`, each keeping a slow `cx.timer` fallback for changes with no file event.
 
 ## Done when
 

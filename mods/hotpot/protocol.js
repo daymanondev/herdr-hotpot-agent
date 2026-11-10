@@ -52,6 +52,40 @@ export function parseHotpotJson(stdout, fallback) {
 }
 
 // ---------------------------------------------------------------------------
+// Space & exec plumbing shared by both mods
+// ---------------------------------------------------------------------------
+
+/** The Space a mod acts on: the active one, else the first, else none.
+ * Pure over the `spaces()` listing so it stays testable outside herdr. */
+export function activeSpace(allSpaces) {
+  const all = Array.isArray(allSpaces) ? allSpaces : [];
+  return all.find((s) => s.active) ?? all[0] ?? null;
+}
+
+/** The workspace folder a mod runs `hotpot` against: the Space's folder, or
+ * the caller's fallback (`home()`) when the Space carries none. */
+export function spaceFolder(space, fallback) {
+  return space?.folder || fallback;
+}
+
+/** The standard exec options for talking to the `hotpot` engine from a Space:
+ * the workspace as cwd, the Space's machine as the target host, and a bounded
+ * timeout. One source of truth for the shape both mods exec with. */
+export function hotpotExecOptions(space, folder, timeoutMs = 5000) {
+  return { cwd: folder, on: space?.machine ?? null, timeout: timeoutMs };
+}
+
+/** The directory containing `path` (both `/` and `\` separators), or `null`
+ * when there is no parent to watch — the Session Inspector's `watchFolder`
+ * target for the transcript a `hotpot inspect` served. */
+export function parentDir(path) {
+  if (typeof path !== "string" || path === "") return null;
+  const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  if (cut <= 0) return null;
+  return path.slice(0, cut);
+}
+
+// ---------------------------------------------------------------------------
 // Attention-First view model (ticket 13)
 // ---------------------------------------------------------------------------
 
