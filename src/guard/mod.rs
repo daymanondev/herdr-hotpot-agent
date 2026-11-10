@@ -141,11 +141,21 @@ pub fn evaluate_write_path(
 ) -> ChokeVerdict {
     let norm_target = target_path.replace('\\', "/");
     let norm_state = state_dir.trim_end_matches('/').replace('\\', "/");
-    if !norm_state.is_empty() && norm_target.starts_with(&norm_state) {
-        return ChokeVerdict::deny(
-            "state-dir-protected",
-            "Direct writes to Hotpot state directory are forbidden",
-        );
+    if !norm_state.is_empty() && norm_target.starts_with(&format!("{norm_state}/")) {
+        // Isolated peer worktrees live under `<state>/runtime/v1/<slug>/worktrees/`
+        // — that subtree is the peer's assigned workspace, not protected runtime
+        // state, so writes there fall through to the role rules. Everything else
+        // under Hotpot Home (ledger, caches, role homes) stays write-protected.
+        let under_worktrees = norm_target[norm_state.len() + 1..]
+            .split('/')
+            .enumerate()
+            .any(|(i, part)| i == 3 && part == "worktrees");
+        if !under_worktrees {
+            return ChokeVerdict::deny(
+                "state-dir-protected",
+                "Direct writes to Hotpot state directory are forbidden",
+            );
+        }
     }
 
     let norm_ws = workspace_root.trim_end_matches('/').replace('\\', "/");
@@ -466,6 +476,29 @@ mod tests {
             "/state",
         );
         assert!(allow_glossary.allowed);
+    }
+
+    #[test]
+    fn state_dir_stays_protected_except_isolated_peer_worktrees() {
+        // The ledger itself (and every other runtime path) is write-protected.
+        let deny_ledger = evaluate_write_path(
+            Role::Agent,
+            "/home/runtime/v1/proj-ab12cd/ledger.jsonl",
+            "",
+            "/home",
+        );
+        assert!(!deny_ledger.allowed);
+        assert_eq!(deny_ledger.code, "state-dir-protected");
+
+        // An isolated peer worktree under the same state dir is the peer's own
+        // assigned workspace, so writing there is allowed.
+        let allow_worktree = evaluate_write_path(
+            Role::Agent,
+            "/home/runtime/v1/proj-ab12cd/worktrees/asg_001/src/main.rs",
+            "",
+            "/home",
+        );
+        assert!(allow_worktree.allowed);
     }
 
     #[test]

@@ -11,9 +11,11 @@
 //! - `writer_lease_acquired` { assignment, mode, worktree?, cargoTargetDir?, worktreeInclude? }
 //! - `writer_lease_released` { assignment, worktreeAction }
 //! - `writer_lease_reclaimed` { assignment, mode, worktreeAction }
-//! - `assignment_asked`      { assignment, question }          (written by the peer `ask` path)
+//! - `assignment_asked`      { assignment, correlation, question, signal? } (written by the peer `ask` path)
 //! - `assignment_answered`   { assignment, answer }
-//! - `assignment_handed_back`{ assignment, summary }           (written by the peer `handoff` path)
+//! - `workspace_write`       { assignment, correlation, workspace, tool }   (runtime evidence, `hotpot hook`)
+//! - `workspace_gate`        { assignment, correlation, workspace, gate }   (runtime evidence, `hotpot hook`)
+//! - `assignment_handed_back`{ assignment, correlation, summary, candidate?, baseCommit?, scopeViolations? } (written by the peer `handoff` path)
 //! - `gate_started`          { assignment, gate }
 //! - `assignment_accepted`   { assignment, note? }
 //! - `assignment_rejected`   { assignment, note? }
@@ -130,6 +132,13 @@ impl Ledger {
         Ok(Self {
             path: dir.join("ledger.jsonl"),
         })
+    }
+
+    /// Wraps an existing ledger file path (used by the evidence recorder, which
+    /// discovers ledgers under `runtime/v1/` without a project root). Appending
+    /// creates the file only if it does not exist yet.
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
     }
 
     /// Path of the ledger file (used by tests and diagnostics).
