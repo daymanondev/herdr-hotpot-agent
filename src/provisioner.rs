@@ -59,6 +59,11 @@ pub enum PlanItem {
     Dir(PathBuf),
     /// A file with fully rendered contents, written atomically.
     File { path: PathBuf, contents: String },
+    /// A file whose bytes are secret (credential material): identical to [`PlanItem::File`]
+    /// except the copy lands owner-only (`0600`, like the operator's originals) — created
+    /// private, re-pinned private before the rename, so the bytes are never group- or
+    /// world-readable at any moment.
+    PrivateFile { path: PathBuf, contents: String },
     /// A symlink that must point at `target`.
     Symlink { path: PathBuf, target: PathBuf },
     /// An `hc profile set <profile> <key> <value>` change applied via the `hc` CLI.
@@ -72,7 +77,8 @@ pub enum PlanItem {
 impl PlanItem {
     pub fn path(&self) -> Option<&Path> {
         match self {
-            Self::Dir(path) | Self::File { path, .. } | Self::Symlink { path, .. } => Some(path),
+            Self::Dir(path) | Self::File { path, .. } | Self::PrivateFile { path, .. }
+            | Self::Symlink { path, .. } => Some(path),
             Self::HcProfileSet { .. } => None,
         }
     }
@@ -128,7 +134,9 @@ impl Plan {
             .iter()
             .map(|item| match item {
                 PlanItem::Dir(path) => format!("plan: dir {}", path.display()),
-                PlanItem::File { path, .. } => format!("plan: file {}", path.display()),
+                PlanItem::File { path, .. } | PlanItem::PrivateFile { path, .. } => {
+                    format!("plan: file {}", path.display())
+                }
                 PlanItem::Symlink { path, target } => {
                     format!("plan: link {} -> {}", path.display(), target.display())
                 }
@@ -184,6 +192,11 @@ impl Plan {
                     writeln!(out, "applied: file {}", path.display())
                         .map_err(|e| PlanError::new("io", format!("failed to print plan progress: {e}")))?;
                 }
+                PlanItem::PrivateFile { path, contents } => {
+                    atomic_write_private_file(path, contents)?;
+                    writeln!(out, "applied: file {}", path.display())
+                        .map_err(|e| PlanError::new("io", format!("failed to print plan progress: {e}")))?;
+                }
                 PlanItem::Symlink { path, target } => {
                     atomic_symlink(path, target)?;
                     writeln!(out, "applied: link {} -> {}", path.display(), target.display())
@@ -221,7 +234,7 @@ impl Plan {
                         ));
                     }
                 }
-                PlanItem::File { path, .. } => {
+                PlanItem::File { path, .. } | PlanItem::PrivateFile { path, .. } => {
                     if let Ok(meta) = fs::symlink_metadata(path)
                         && meta.is_dir()
                     {
@@ -273,6 +286,53 @@ pub(crate) fn atomic_write_file(path: &Path, contents: &str) -> Result<(), PlanE
     }
     let tmp = temp_sibling(path);
     if let Err(e) = fs::write(&tmp, contents) {
+        let _ = fs::remove_file(&tmp);
+        return Err(PlanError::new(
+            "io",
+            format!("failed to write temp sibling {}: {e}", tmp.display()),
+        ));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(PlanError::new(
+            "io",
+            format!("failed to rename {} over {}: {e}", tmp.display(), path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Writes `contents` to `path` atomically with owner-only (`0600`) permissions — the mode
+/// secret material such as seeded credentials must keep (the operator's originals are
+/// `0600`, and a plain [`atomic_write_file`] copy would land `0644` inside the `0755` Role
+/// Home dirs). The temp sibling is *created* private (`OpenOptions::mode(0o600)`, so the
+/// bytes are never group- or world-readable even mid-write) and re-pinned to `0600` before
+/// the rename — the mode-setting cannot race the rename, and a leftover temp sibling from
+/// an earlier crashed run cannot leak either. The rename carries the mode onto the
+/// destination. Any leftover temporary is removed on failure.
+pub(crate) fn atomic_write_private_file(path: &Path, contents: &str) -> Result<(), PlanError> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| PlanError::new("io", format!("failed to create parent of {}: {e}", path.display())))?;
+    }
+    let tmp = temp_sibling(path);
+    let write = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        // `.mode()` only applies at creation: pin it again so a pre-existing leftover
+        // temp sibling is private before the bytes ride into their final name.
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if let Err(e) = write {
         let _ = fs::remove_file(&tmp);
         return Err(PlanError::new(
             "io",

@@ -8,8 +8,9 @@
 //!
 //! The safety rules (spec: "Credential Seeding & Environment Scoping", first bullet):
 //!
-//! - the copy is always an ordinary file written atomically — never a symlink or hardlink
-//!   into the operator's homes (`legacy-shared-risk` stays detectable);
+//! - the copy is always an ordinary file written atomically with owner-only (`0600`)
+//!   permissions, like the operator's originals — never a symlink or hardlink into the
+//!   operator's homes (`legacy-shared-risk` stays detectable);
 //! - a Role Home that already owns a credential (e.g. created by `hotpot auth login`) is
 //!   never overwritten, so intentional per-seat account overrides stay durable;
 //! - the operator's home is a strictly read-only input — nothing under `~/.codex`,
@@ -23,7 +24,7 @@
 //!   shape only — no token value is ever read into any output.
 
 use crate::auth::{PRESERVED_SHAPE_FILE, preserved_shape_contents};
-use crate::provisioner::{PlanError, PlanItem, atomic_write_file};
+use crate::provisioner::{PlanError, PlanItem, atomic_write_file, atomic_write_private_file};
 use crate::role_homes::{role_home_dir, seat_credentials_file};
 use serde_json::Value;
 use std::fs;
@@ -73,7 +74,9 @@ pub fn seed_plan_items(home: &Path, operator_home: &Path, agent: &str, role: &st
     };
     let sidecar = preserved_shape_contents(&contents);
     vec![
-        PlanItem::File {
+        // The credential copy is secret material: it rides the private write path so it
+        // lands `0600` like the operator's original instead of the default `0644`.
+        PlanItem::PrivateFile {
             path: credential,
             contents,
         },
@@ -97,10 +100,15 @@ pub fn seed_seat_credential(
     let items = seed_plan_items(home, operator_home, agent, role);
     let seeded = !items.is_empty();
     for item in items {
-        let PlanItem::File { path, contents } = item else {
-            continue;
-        };
-        atomic_write_file(&path, &contents)?;
+        match item {
+            PlanItem::PrivateFile { path, contents } => {
+                atomic_write_private_file(&path, &contents)?;
+            }
+            PlanItem::File { path, contents } => {
+                atomic_write_file(&path, &contents)?;
+            }
+            _ => continue,
+        }
     }
     Ok(seeded)
 }

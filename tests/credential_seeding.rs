@@ -230,6 +230,12 @@ fn setup_apply_seeds_independent_copies_into_every_role_home_that_lacks_one() {
                 "the seeded credential for {agent}/{role} must not be a hardlink"
             );
             assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "the seeded credential for {agent}/{role} must stay owner-only (0600) like \
+                 the operator's original, not group/world-readable inside the Role Home"
+            );
+            assert_eq!(
                 fs::read(&seeded).unwrap(),
                 operator_bytes,
                 "the seeded credential for {agent}/{role} must equal the operator bytes"
@@ -538,6 +544,11 @@ fn seat_launch_seeds_a_missing_credential_before_creating_the_terminal() {
     let meta = fs::symlink_metadata(&seeded)
         .unwrap_or_else(|e| panic!("launch must seed the missing credential: {e}"));
     assert!(meta.is_file() && !meta.file_type().is_symlink() && meta.nlink() == 1);
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "the on-demand seeded credential must also land owner-only (0600)"
+    );
     assert_eq!(
         fs::read_to_string(&seeded).unwrap(),
         operator_bytes,
