@@ -1,6 +1,7 @@
 // Right-hand Hotpot panel: Seat Slots, peer tree, header presets, strict
-// *Quiet When Quiet* ergonomics (ticket 05), and Herdr's native visual system
-// (ticket 06).
+// *Quiet When Quiet* ergonomics (ticket 05), Herdr's native visual system
+// (ticket 06), and attention Ack/Dismiss plus the bottom Directive Composer
+// with its onboarding chip (ticket 07).
 //
 // The panel always shows the Project's Supervisor and Lead Seat Slots — live
 // seat data when running, the role's configured profile defaults plus a
@@ -13,6 +14,14 @@
 // (streamed in through `watchFolder` on the runtime root, with a slow timer
 // fallback for changes that have no file event).
 //
+// Every surfaced Attention Letter carries inline `Ack` (useful) / `Dismiss`
+// (noisy) actions that exec `hotpot attention feedback` directly, and its row
+// selects the affected seat into the Session Inspector. Pinned at the panel
+// bottom, the Directive Composer delivers a typed directive to Lead (default)
+// or Supervisor through the launch-then-prompt `hotpot seat launch --prompt`
+// flow — with a 1-click `Onboard project` chip above it while the Project
+// lacks a Workspace Protocol.
+//
 // Every row speaks the native design system: vendor icons resolved from
 // Herdr's `knownAgents()` registry (tinted `svg` glyphs or full-color
 // `image`s, the terminal glyph as fallback), quiet geometric state markers
@@ -22,7 +31,7 @@
 // `agent / model · thinking` selector that persists each click immediately.
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
+import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import {
   exec,
   spaces,
@@ -51,6 +60,8 @@ import {
   seatStatusMarker,
   markerToneColor,
   attentionView,
+  attentionFeedbackArgs,
+  attentionSeatTarget,
   contextBarModel,
   formatTokenCount,
   profileSetArgs,
@@ -60,6 +71,9 @@ import {
   sectionVisibility,
   presetMenu,
   startSlotSteps,
+  directiveDispatchSteps,
+  onboardingChipModel,
+  onboardingDispatchSteps,
 } from "./protocol.js";
 
 function warningColor(t) {
@@ -82,6 +96,22 @@ export default class HotpotPanel extends View {
     this.presetMenuOpen = false;
     // The seat role whose `Start` sequence is currently exec-ing.
     this.starting = null;
+    // Directive Composer (ticket 07): the target seat a typed directive
+    // addresses (Lead by default), its input state (Enter submits), the
+    // dispatch busy state, and the last dispatch error — an error stays
+    // visible until the next dispatch's refresh.
+    this.composerTarget = "lead";
+    this.composerInput = InputState.new(cx, {
+      placeholder: "Type a directive, Enter to send",
+    });
+    this.composerInput.on("submit", (_e, inputCx) => this.sendDirective(inputCx));
+    this.composerBusy = false;
+    this.composerError = null;
+    // The onboarding chip's dispatch busy state.
+    this.onboardingBusy = false;
+    // The Attention Letter feedback exec in flight (`<action>:<key>`), shown
+    // as the pressed button's busy state.
+    this.feedbackBusy = null;
     // Herdr's program table (`knownAgents()`): the vendor icon registry the
     // seat and peer rows resolve their agent icons against, asked for once
     // per panel. A rejected ask leaves it empty — every icon then falls back
@@ -212,6 +242,134 @@ export default class HotpotPanel extends View {
         this.refresh(taskCx);
       }
     });
+  }
+
+  // The inline Ack (useful) / Dismiss (noisy) on a surfaced Attention Letter:
+  // exec the feedback argv with a brief busy state on the pressed button,
+  // then refresh — the suppression (or its absence) shows up in the next
+  // snapshot. An invalid payload throws inside the builder and never reaches
+  // the engine.
+  sendAttentionFeedback(cx, item, action) {
+    if (this.feedbackBusy) return;
+    let args;
+    try {
+      args = attentionFeedbackArgs(item.key, action);
+    } catch {
+      return;
+    }
+    const sp = activeSpace(spaces());
+    const folder = spaceFolder(sp, home());
+    this.feedbackBusy = `${action}:${item.key}`;
+    cx.notify();
+    cx.spawn(async (taskCx) => {
+      try {
+        await exec("hotpot", args, hotpotExecOptions(sp, folder));
+      } catch {
+        // the letter stays as-is; the refresh below shows reality
+      } finally {
+        this.feedbackBusy = null;
+        this.refresh(taskCx);
+      }
+    });
+  }
+
+  // Runs one launch-then-prompt step sequence (Directive Composer Send and
+  // the onboarding chip share it): each step execs in order, the first
+  // failure stops the sequence and surfaces through `onError`, and the busy
+  // flag plus post-action refresh always settle in the `finally`.
+  runDispatchSteps(cx, steps, onError, onDone) {
+    const sp = activeSpace(spaces());
+    const folder = spaceFolder(sp, home());
+    cx.spawn(async (taskCx) => {
+      try {
+        for (const step of steps) {
+          try {
+            const res = await exec(
+              "hotpot",
+              step.args,
+              hotpotExecOptions(sp, folder, step.timeoutMs ?? 5000),
+            );
+            if (res.code !== 0) {
+              throw new Error((res.stderr || res.stdout || "hotpot exited").trim());
+            }
+          } catch (err) {
+            onError(String(err?.message ?? err));
+            break; // stop at the first failed step; the refresh shows reality
+          }
+        }
+      } finally {
+        onDone();
+        this.refresh(taskCx);
+      }
+    });
+  }
+
+  // One composer Send (Enter or the Send button): build the launch-then-prompt
+  // sequence for the typed directive against the composer's target, clear the
+  // input on dispatch, and keep a busy state while it runs. Failures surface
+  // as the composer's error and stay visible until the next dispatch.
+  sendDirective(cx) {
+    if (this.composerBusy) return;
+    const text = (this.composerInput?.value?.() ?? "").trim();
+    if (!text) return;
+    const agent = this.snapshot?.profiles?.[this.composerTarget]?.agent;
+    let steps;
+    try {
+      steps = directiveDispatchSteps(
+        this.snapshot,
+        this.composerTarget,
+        agent,
+        spaceFolder(activeSpace(spaces()), home()),
+        text,
+      );
+    } catch (err) {
+      this.composerError = String(err?.message ?? err);
+      cx.notify();
+      return;
+    }
+    this.composerError = null;
+    this.composerInput?.set_value?.("", cx);
+    this.composerBusy = true;
+    cx.notify();
+    this.runDispatchSteps(
+      cx,
+      steps,
+      (message) => {
+        this.composerError = message;
+      },
+      () => {
+        this.composerBusy = false;
+      },
+    );
+  }
+
+  // The 1-click `Onboard project` chip: dispatch the built-in onboarding
+  // directive to Lead through the same launch-then-prompt flow, provisioning
+  // first when the Project needs it. No configured Lead agent leaves the chip
+  // inert — there is nothing to launch or instruct.
+  runOnboarding(cx) {
+    if (this.onboardingBusy) return;
+    const agent = this.snapshot?.profiles?.lead?.agent;
+    let steps;
+    try {
+      steps = onboardingDispatchSteps(
+        this.snapshot,
+        agent,
+        spaceFolder(activeSpace(spaces()), home()),
+      );
+    } catch {
+      return;
+    }
+    this.onboardingBusy = true;
+    cx.notify();
+    this.runDispatchSteps(
+      cx,
+      steps,
+      () => {},
+      () => {
+        this.onboardingBusy = false;
+      },
+    );
   }
 
   // A named preset applies its coherent per-role map to the room's seats.
@@ -350,7 +508,31 @@ export default class HotpotPanel extends View {
   // Attention (pinned on top; quiet collapses to the All clear indicator)
   // ---------------------------------------------------------------------------
 
-  renderAttention(t) {
+  // The inline Ack (useful) / Dismiss (noisy) affordance of one letter: small
+  // quiet chips with a busy state on the pressed one. Both stop propagation —
+  // the row's own click selects the affected seat, never the buttons.
+  renderAttentionAction(t, cx, item, action, label) {
+    const busy = this.feedbackBusy === `${action}:${item.key}`;
+    return div()
+      .id(`att-${item.key}-${action}`)
+      .px(6)
+      .py(2)
+      .rounded(6)
+      .bg(busy ? t.canvas : t.raised)
+      .border(1)
+      .border_color(t.border)
+      .text_size(10)
+      .font_semibold()
+      .text_color(busy ? t.dim : t.muted)
+      .hover((s) => s.bg(t.hover))
+      .child(busy ? `${label} …` : label)
+      .on_click((_e, clickCx) => {
+        clickCx.stop_propagation();
+        this.sendAttentionFeedback(cx, item, action);
+      });
+  }
+
+  renderAttention(t, cx) {
     const view = attentionView(this.snapshot);
     if (view.quiet) {
       // Strict Quiet When Quiet: one quiet indicator, no placeholder box.
@@ -387,6 +569,12 @@ export default class HotpotPanel extends View {
           .bg(t.surface)
           .border(1)
           .border_color(item.exception ? warningColor(t) : t.border)
+          .hover((s) => s.bg(t.hover))
+          .on_click(() => {
+            // Row-click selects the affected seat into the Session Inspector.
+            const seat = attentionSeatTarget(item, this.snapshot);
+            if (seat) this.selectAgent(seat, "inspector");
+          })
           .children([
             h_flex()
               .items_center()
@@ -403,7 +591,19 @@ export default class HotpotPanel extends View {
                     : null,
                 ].filter(Boolean),
               ),
-            div().text_size(11).text_color(t.foreground).truncate().child(item.text || item.key),
+            h_flex()
+              .items_center()
+              .gap(4)
+              .children([
+                div()
+                  .flex_1()
+                  .text_size(11)
+                  .text_color(t.foreground)
+                  .truncate()
+                  .child(item.text || item.key),
+                this.renderAttentionAction(t, cx, item, "useful", "Ack"),
+                this.renderAttentionAction(t, cx, item, "noisy", "Dismiss"),
+              ]),
           ]);
       }),
     ]);
@@ -963,6 +1163,134 @@ export default class HotpotPanel extends View {
     ]);
   }
 
+  // ---------------------------------------------------------------------------
+  // Directive Composer (pinned at the panel bottom) + onboarding chip
+  // ---------------------------------------------------------------------------
+
+  // The 1-click `Onboard project` chip: visible only while the snapshot says
+  // the Project lacks a Workspace Protocol. One click dispatches the
+  // onboarding directive to Lead through the launch-then-prompt flow.
+  renderOnboardingChip(t, cx) {
+    const chip = onboardingChipModel(this.snapshot);
+    if (!chip.visible) return null;
+    const busy = this.onboardingBusy;
+    return h_flex()
+      .id("onboarding-chip")
+      .items_center()
+      .gap(5)
+      .px(8)
+      .py(5)
+      .rounded(8)
+      .bg(busy ? t.canvas : t.raised)
+      .border(1)
+      .border_color(t.border)
+      .hover((s) => s.bg(t.hover))
+      .on_click((_e, clickCx) => {
+        clickCx.stop_propagation();
+        this.runOnboarding(cx);
+      })
+      .children([
+        svg("mods/workspace-chrome/plus.svg").size(11).flex_none().text_color(t.accent),
+        div()
+          .text_size(11)
+          .font_semibold()
+          .text_color(busy ? t.dim : t.foreground)
+          .child(busy ? "Onboarding …" : "Onboard project"),
+      ]);
+  }
+
+  // The composer's target toggle: Lead (default) or Supervisor — the two 1:1
+  // seats a directive may address. Peers are dispatched by Lead, never typed
+  // at here.
+  renderComposerTarget(t, role, label) {
+    const selected = this.composerTarget === role;
+    return div()
+      .id(`composer-target-${role}`)
+      .px(6)
+      .py(2)
+      .rounded(8)
+      .bg(selected ? t.selected : t.raised)
+      .border(1)
+      .border_color(selected ? t.accent : t.border)
+      .text_size(10)
+      .text_color(selected ? t.accent : t.muted)
+      .hover((s) => s.bg(t.hover))
+      .child(label)
+      .on_click((_e, clickCx) => {
+        clickCx.stop_propagation();
+        this.composerTarget = role;
+        clickCx.notify();
+      });
+  }
+
+  // The Directive Composer (GLOSSARY.md): the persistent input at the panel
+  // bottom through which the Human sends a directive to Lead or Supervisor —
+  // Enter or Send dispatches the launch-then-prompt flow, the input clears on
+  // dispatch, and a failed dispatch's error stays visible until the next one.
+  renderComposer(t, cx) {
+    return v_flex()
+      .id("directive-composer")
+      .flex_none()
+      .gap(4)
+      .p(8)
+      .rounded(8)
+      .bg(t.surface)
+      .border(1)
+      .border_color(t.input)
+      .children([
+        h_flex()
+          .items_center()
+          .gap(4)
+          .children([
+            div().text_size(11.5).font_medium().text_color(t.dim).child("Directive"),
+            this.renderComposerTarget(t, "lead", "Lead"),
+            this.renderComposerTarget(t, "supervisor", "Supervisor"),
+          ]),
+        h_flex()
+          .items_center()
+          .gap(8)
+          .children([
+            div().flex_1().child(Input.new(this.composerInput)),
+            this.composerBusy
+              ? div()
+                  .id("composer-send-busy")
+                  .px(10)
+                  .p(6)
+                  .rounded(6)
+                  .bg(t.canvas)
+                  .text_size(12)
+                  .text_color(t.dim)
+                  .child("Sending …")
+              : div()
+                  .id("composer-send")
+                  .px(10)
+                  .p(6)
+                  .rounded(6)
+                  .bg(t.solid)
+                  .text_size(12)
+                  .font_semibold()
+                  .text_color(t.solid_foreground)
+                  .hover((s) => s.bg(t.hover))
+                  .child("Send")
+                  .on_click((_e, clickCx) => {
+                    clickCx.stop_propagation();
+                    this.sendDirective(cx);
+                  }),
+          ]),
+        ...(this.composerError
+          ? [
+              div()
+                .id("composer-error")
+                .text_size(10)
+                .font_semibold()
+                .text_color(warningColor(t))
+                .truncate()
+                .child(this.composerError),
+            ]
+          : []),
+      ]);
+  }
+
   render(cx) {
     const t = theme();
     const sp = activeSpace(spaces());
@@ -973,6 +1301,7 @@ export default class HotpotPanel extends View {
     const slots = seatSlotsModel(this.snapshot);
     const tasks = Array.isArray(this.snapshot?.tasks) ? this.snapshot.tasks : [];
     const mailbox = Array.isArray(this.snapshot?.mailbox) ? this.snapshot.mailbox : [];
+    const onboardingChip = this.renderOnboardingChip(t, cx);
 
     return v_flex()
       .id("root")
@@ -980,9 +1309,9 @@ export default class HotpotPanel extends View {
       .bg(t.chrome)
       .p(10)
       .gap(10)
-      .overflow_y_scrollbar()
       .children([
         h_flex()
+          .flex_none()
           .items_center()
           .justify_between()
           .children([
@@ -1007,38 +1336,54 @@ export default class HotpotPanel extends View {
                 this.renderPresetMenuButton(t),
               ]),
           ]),
-        ...(this.presetMenuOpen ? [this.renderPresetMenu(t, cx)] : []),
 
-        // Attention stays pinned above every other section; quiet collapses
-        // it to the single All clear indicator.
-        this.renderAttention(t),
-
-        // The Seats section always renders: the two Seat Slots plus the
-        // child Peer tree under Lead — never an empty placeholder box.
+        // The scrolling column carries every list section; the composer below
+        // stays pinned at the panel bottom regardless of scroll.
         v_flex()
-          .gap(6)
+          .id("panel-scroll")
+          .flex_1()
+          .min_h(0)
+          .gap(10)
+          .overflow_y_scrollbar()
           .children([
-            this.sectionHeader(t, "Seats", sections.seats.count, false),
-            this.renderSeatSlot(t, slots.supervisor, selectedId, cx),
-            this.renderSeatSlot(t, slots.lead, selectedId, cx),
-            ...slots.lead.peers.map((peer) => this.renderPeerRow(t, peer, selectedId)),
+            ...(this.presetMenuOpen ? [this.renderPresetMenu(t, cx)] : []),
+
+            // Attention stays pinned above every other section; quiet
+            // collapses it to the single All clear indicator.
+            this.renderAttention(t, cx),
+
+            // The Seats section always renders: the two Seat Slots plus the
+            // child Peer tree under Lead — never an empty placeholder box.
+            v_flex()
+              .gap(6)
+              .children([
+                this.sectionHeader(t, "Seats", sections.seats.count, false),
+                this.renderSeatSlot(t, slots.supervisor, selectedId, cx),
+                this.renderSeatSlot(t, slots.lead, selectedId, cx),
+                ...slots.lead.peers.map((peer) => this.renderPeerRow(t, peer, selectedId)),
+              ]),
+
+            v_flex()
+              .gap(6)
+              .children([
+                this.sectionHeader(
+                  t,
+                  "Assignments",
+                  sections.assignments.count,
+                  sections.assignments.folded,
+                ),
+                ...(sections.assignments.folded
+                  ? []
+                  : tasks.map((task) => this.renderTaskCard(t, task, selectedId))),
+              ]),
+
+            ...(sections.activity.hidden ? [] : [this.renderActivity(t, mailbox)]),
           ]),
 
-        v_flex()
-          .gap(6)
-          .children([
-            this.sectionHeader(
-              t,
-              "Assignments",
-              sections.assignments.count,
-              sections.assignments.folded,
-            ),
-            ...(sections.assignments.folded
-              ? []
-              : tasks.map((task) => this.renderTaskCard(t, task, selectedId))),
-          ]),
-
-        ...(sections.activity.hidden ? [] : [this.renderActivity(t, mailbox)]),
+        // Bottom: the onboarding chip (only while the Project lacks a
+        // Workspace Protocol) above the pinned Directive Composer.
+        ...(onboardingChip ? [onboardingChip] : []),
+        this.renderComposer(t, cx),
       ]);
   }
 }
