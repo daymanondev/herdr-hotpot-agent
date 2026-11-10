@@ -93,6 +93,17 @@ fn run_hotpot(
         .unwrap()
 }
 
+/// Runs `hotpot` with both `HOTPOT_HOME` and `HOME` unset (home-unresolvable failure mode).
+fn run_hotpot_without_home_env(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_hotpot"))
+        .args(args)
+        .env_remove("HOTPOT_HOME")
+        .env_remove("HOME")
+        .env("PATH", sandbox_path(None))
+        .output()
+        .unwrap()
+}
+
 fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -444,6 +455,93 @@ fn remove_on_missing_home_is_a_clean_no_op() {
         stderr_of(&out)
     );
     assert!(!missing.exists());
+}
+
+#[test]
+fn setup_apply_refuses_directory_occupied_path_with_no_partial_state() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    // Pre-occupy the planned `hotpot.json` path with a directory holding a file.
+    let occupied = home.path().join("hotpot.json");
+    fs::create_dir_all(&occupied).unwrap();
+    fs::write(occupied.join("inner.txt"), "occupied\n").unwrap();
+    let tree_before = relative_tree(home.path());
+
+    let out = run_hotpot(home.path(), fake_home.path(), None, &["setup", "--apply"]);
+    assert!(
+        !out.status.success(),
+        "setup --apply must exit non-zero when a planned file path is a directory"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("hotpot.json"),
+        "the refusal diagnostic must name the conflicting path:\n{stderr}"
+    );
+
+    // No partial state: nothing else was provisioned and no temporary siblings remain.
+    assert_eq!(
+        relative_tree(home.path()),
+        tree_before,
+        "refusal must happen before any disk mutation"
+    );
+    assert!(
+        occupied.join("inner.txt").exists(),
+        "the occupied directory must be left untouched"
+    );
+    assert!(
+        relative_tree(home.path())
+            .iter()
+            .all(|rel| !rel.contains("hotpot-tmp")),
+        "no temporary sibling files may remain anywhere under the temp home"
+    );
+}
+
+#[test]
+fn setup_apply_replaces_existing_files_atomically_on_re_run() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+
+    let first = run_hotpot(home.path(), fake_home.path(), None, &["setup", "--apply"]);
+    assert!(first.status.success());
+    let marker = home.path().join("hotpot.json");
+    let rendered = fs::read_to_string(&marker).unwrap();
+    assert!(!rendered.trim().is_empty());
+
+    // Corrupt the provisioned file, then re-run: the final content must be exactly the new
+    // rendering, with no temporary/partial siblings left behind.
+    fs::write(&marker, "corrupted half-written").unwrap();
+    let second = run_hotpot(home.path(), fake_home.path(), None, &["setup", "--apply"]);
+    assert!(
+        second.status.success(),
+        "re-running setup --apply must succeed:\n{}",
+        stderr_of(&second)
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        rendered,
+        "re-apply must atomically restore exactly the new rendering"
+    );
+    assert!(
+        relative_tree(home.path())
+            .iter()
+            .all(|rel| !rel.contains("hotpot-tmp")),
+        "no .tmp/partial siblings may remain after re-apply"
+    );
+}
+
+#[test]
+fn setup_and_remove_exit_nonzero_with_stderr_when_home_cannot_be_resolved() {
+    for subcommand in ["setup", "remove"] {
+        let out = run_hotpot_without_home_env(&[subcommand]);
+        assert!(
+            !out.status.success(),
+            "`hotpot {subcommand}` without HOTPOT_HOME or HOME must exit non-zero"
+        );
+        assert!(
+            !stderr_of(&out).trim().is_empty(),
+            "`hotpot {subcommand}` must print a stderr diagnostic"
+        );
+    }
 }
 
 
