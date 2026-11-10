@@ -441,8 +441,10 @@ fn no_symlink_under_roles_ever_targets_an_operator_home_file() {
     let sentinels = plant_operator_sentinels(fake_home.path());
     run_setup_apply(home.path(), fake_home.path(), &[]);
 
-    // Walk every entry under roles/; any symlink must not resolve into the fake operator
-    // home (mutable operator credential files are never symlinked into a Role Home).
+    // Walk every entry under roles/; the only symlinks setup plants there are the Lead
+    // skills wirings into the managed aggregates, so any symlink must resolve strictly
+    // inside Hotpot Home — never into the operator's home (mutable operator credential
+    // files are never symlinked into a Role Home).
     let mut stack = vec![home.path().join("roles")];
     let mut symlink_count = 0usize;
     while let Some(dir) = stack.pop() {
@@ -466,13 +468,19 @@ fn no_symlink_under_roles_ever_targets_an_operator_home_file() {
                     path.display(),
                     resolved.display()
                 );
+                assert!(
+                    resolved.starts_with(home.path()),
+                    "symlink {} may only target Hotpot Home itself, got {}",
+                    path.display(),
+                    resolved.display()
+                );
             }
         }
     }
-    // The provisioned roles/ tree is entirely regular files and directories.
+    // The Lead skills wirings are the only symlinks under roles/: one per agent family.
     assert_eq!(
-        symlink_count, 0,
-        "setup must not plant any symlink under roles/"
+        symlink_count, 3,
+        "setup plants exactly the three Lead skills wirings under roles/"
     );
     assert_operator_sentinels_unchanged(&sentinels);
 }

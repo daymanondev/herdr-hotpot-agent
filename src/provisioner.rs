@@ -83,6 +83,9 @@ impl PlanItem {
 pub struct Plan {
     pub home: PathBuf,
     pub items: Vec<PlanItem>,
+    /// Non-item report lines the plan must surface in both dry-run and apply output (e.g.
+    /// deterministic skill-collision exclusions).
+    pub notes: Vec<String>,
 }
 
 impl Plan {
@@ -138,8 +141,12 @@ impl Plan {
             .collect()
     }
 
-    /// Prints the dry-run report without mutating anything.
+    /// Prints the dry-run report without mutating anything: the plan's report notes first
+    /// (e.g. collision exclusions), then every planned change.
     pub fn print_dry_run(&self, out: &mut impl Write) -> std::io::Result<()> {
+        for note in &self.notes {
+            writeln!(out, "{note}")?;
+        }
         for line in self.render_plan_lines() {
             writeln!(out, "{line}")?;
         }
@@ -154,11 +161,16 @@ impl Plan {
     ///
     /// Pre-flights every planned path shape before touching disk (no partial state), writes
     /// files and symlinks atomically via a temporary sibling + rename, and applies `hc`
-    /// profile changes through the discovered `hc` binary.
+    /// profile changes through the discovered `hc` binary. Report notes (collision
+    /// exclusions) are printed before the applied changes.
     pub fn apply(&self, out: &mut impl Write) -> Result<(), PlanError> {
         self.validate()?;
         self.preflight_path_shapes()?;
 
+        for note in &self.notes {
+            writeln!(out, "{note}")
+                .map_err(|e| PlanError::new("io", format!("failed to print plan note: {e}")))?;
+        }
         for item in &self.items {
             match item {
                 PlanItem::Dir(path) => {
@@ -482,17 +494,22 @@ pub fn guard_removal_root(home: &Path) -> Result<(), PlanError> {
 /// Builds the base Hotpot Home plan: the home skeleton directories, the nine Role Homes
 /// (vendor configs + additive instruction artifacts + Capability Hygiene closures, via
 /// [`role_homes::seat_plan_items`]), `AUTHENTICATION.md`, and the `hotpot.json` marker
-/// carrying the role-contract digest and runtime opt-in state. `runtime/` is never part of a
-/// plan (preserve-only); `hc` profile changes are only planned when `hc` is discoverable on
-/// `PATH`. Fails closed when the operator's Codex model catalog cannot be produced scrubbed
-/// ([`hygiene::operator_codex_catalog`]). Later tickets plug skill-projection generators into
-/// this same [`Plan`].
+/// carrying the role-contract digest and runtime opt-in state. Skill projections (the
+/// built-in `hotpot-project-onboarding` skill, the per-agent Lead aggregates with their Role
+/// Home wirings, the Peer hygiene projections, and the `skill-projections/manifest.json`
+/// fence source) are generated from the read-only operator skill roots under
+/// `operator_home` (`~/.codex/skills`, `~/.claude/skills`, `~/.pi/agent/skills`); collision
+/// exclusions ride along as plan notes. `runtime/` is never part of a plan (preserve-only);
+/// `hc` profile changes are only planned when `hc` is discoverable on `PATH`. Fails closed
+/// when the operator's Codex model catalog cannot be produced scrubbed
+/// ([`hygiene::operator_codex_catalog`]).
 pub fn base_home_plan(
     home: &Path,
     hotpot_bin: &Path,
     contracts: &RenderedContracts,
     runtime_opt_in: bool,
     hc_available: bool,
+    operator_home: &Path,
 ) -> Result<Plan, PlanError> {
     let codex_catalog = hygiene::scrubbed_catalog_contents(&hygiene::operator_codex_catalog()?);
     let mut items: Vec<PlanItem> = Vec::new();
@@ -515,6 +532,8 @@ pub fn base_home_plan(
             home.join("skill-projections").join(agent).join("lead"),
         ));
     }
+    let skill_projection = crate::skills::plan_skill_projection(home, operator_home);
+    items.extend(skill_projection.items);
     items.push(PlanItem::File {
         path: home.join("hotpot.json"),
         contents: hotpot_marker_contents(contracts, runtime_opt_in),
@@ -533,5 +552,6 @@ pub fn base_home_plan(
     Ok(Plan {
         home: home.to_path_buf(),
         items,
+        notes: skill_projection.collision_notes,
     })
 }

@@ -42,6 +42,10 @@ _Avoid_: clean-room sandbox, shared home
 The configuration boundary that withholds orchestration surfaces (`hotpot*` and `paseo*` skills, `plugins`, `hooks`, `commands`, `prompts`, and orchestration MCP tools) from `Peer` and closes native subagent spawning across all `Seats`, without pretending to be an OS-level shell sandbox.
 _Avoid_: PreToolUse sandbox, regex firewall
 
+**Skill Projection**:
+The copy of an operator skill tree a `hotpot setup` run places under Hotpot Home. The Lead Aggregate (`skill-projections/<agent>/lead/`, wired into each Lead's `skills` symlink) carries every non-colliding, non-orchestration operator skill in full plus the built-in `hotpot-project-onboarding` skill; the Peer projection (`roles/<agent>/peer/skills/`) additionally withholds executable resources and any skill referencing the Workspace Protocol. Collisions (one skill name from several operator roots) are excluded everywhere and reported in the setup plan.
+_Avoid_: skills symlink farm, vendor skill sync
+
 **Workspace Protocol (`WORKSPACE_PROTOCOL.md`)**:
 An optional file at a repository's root defining repository-specific workflow tactics (topology, model routing, proof gates, review rules). Read exclusively by `Lead` and drafted proposal-first via the `hotpot-project-onboarding` skill under explicit `Human` instruction; `Peer` is never told the file exists.
 _Avoid_: global workflow doc, `AGENTS.md` orchestration dump

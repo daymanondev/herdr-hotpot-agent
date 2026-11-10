@@ -5,7 +5,7 @@
 //! fake `hc` shim on PATH, then assert stdout/stderr text, exit codes, and the file tree under
 //! the temp home. Zero network; the operator homes under the fake `HOME` are read-only inputs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -39,42 +39,60 @@ impl Drop for TempDir {
     }
 }
 
-/// Expected skeleton of the base Hotpot Home plan, derived from the spec's Provisioner Layer
-/// artifact list (`roles/<codex|claude|pi>/<supervisor|lead|peer>/` with per-vendor configs,
-/// instruction artifacts, and Capability Hygiene closure files — the scrubbed Codex
-/// `models.json` catalog and the Claude/Pi `launch.json` configs — plus `skills/`,
-/// `skill-projections/<agent>/lead/`, `hotpot.json` marker, `AUTHENTICATION.md`) — the
-/// independent source of truth for the dry-run assertions below.
-fn base_plan_relative_paths() -> BTreeSet<String> {
-    let mut paths = BTreeSet::new();
+/// Expected skeleton of the base Hotpot Home plan over an empty operator home, derived from
+/// the spec's Provisioner Layer artifact list (`roles/<codex|claude|pi>/<supervisor|lead|peer>/`
+/// with per-vendor configs, instruction artifacts, and Capability Hygiene closure files —
+/// the scrubbed Codex `models.json` catalog and the Claude/Pi `launch.json` configs — plus
+/// `skills/` with the built-in `hotpot-project-onboarding` skill, `skill-projections/<agent>/lead/`
+/// aggregates wired into each Lead's `skills` symlink, the `skill-projections/manifest.json`
+/// fence source, `hotpot.json` marker, `AUTHENTICATION.md`) — the independent source of truth
+/// for the dry-run assertions below.
+///
+/// Returns `relative path -> plan kind` (`dir` | `file` | `link`).
+fn base_plan_items() -> BTreeMap<String, &'static str> {
+    let mut items = BTreeMap::new();
     for agent in ["codex", "claude", "pi"] {
         for role in ["supervisor", "lead", "peer"] {
-            paths.insert(format!("roles/{agent}/{role}"));
+            items.insert(format!("roles/{agent}/{role}"), "dir");
             match agent {
                 "codex" => {
-                    paths.insert(format!("roles/codex/{role}/config.json"));
-                    paths.insert(format!("roles/codex/{role}/models.json"));
+                    items.insert(format!("roles/codex/{role}/config.json"), "file");
+                    items.insert(format!("roles/codex/{role}/models.json"), "file");
                 }
                 "claude" => {
-                    paths.insert(format!("roles/claude/{role}/mcp.json"));
-                    paths.insert(format!("roles/claude/{role}/settings.json"));
-                    paths.insert(format!("roles/claude/{role}/CLAUDE.md"));
-                    paths.insert(format!("roles/claude/{role}/launch.json"));
+                    items.insert(format!("roles/claude/{role}/mcp.json"), "file");
+                    items.insert(format!("roles/claude/{role}/settings.json"), "file");
+                    items.insert(format!("roles/claude/{role}/CLAUDE.md"), "file");
+                    items.insert(format!("roles/claude/{role}/launch.json"), "file");
                 }
                 "pi" => {
-                    paths.insert(format!("roles/pi/{role}/settings.json"));
-                    paths.insert(format!("roles/pi/{role}/APPEND_SYSTEM.md"));
-                    paths.insert(format!("roles/pi/{role}/launch.json"));
+                    items.insert(format!("roles/pi/{role}/settings.json"), "file");
+                    items.insert(format!("roles/pi/{role}/APPEND_SYSTEM.md"), "file");
+                    items.insert(format!("roles/pi/{role}/launch.json"), "file");
                 }
                 other => panic!("unknown agent {other}"),
             }
         }
-        paths.insert(format!("skill-projections/{agent}/lead"));
+        items.insert(format!("skill-projections/{agent}/lead"), "dir");
+        // Lead skills wiring: the seat's skills directory points at the managed aggregate.
+        items.insert(format!("roles/{agent}/lead/skills"), "link");
+        // The aggregate always carries the built-in onboarding skill (symlinked to the
+        // canonical asset under `skills/`).
+        items.insert(
+            format!("skill-projections/{agent}/lead/hotpot-project-onboarding"),
+            "link",
+        );
+        items.insert(format!("roles/{agent}/peer/skills"), "dir");
     }
-    paths.insert("skills".to_string());
-    paths.insert("hotpot.json".to_string());
-    paths.insert("AUTHENTICATION.md".to_string());
-    paths
+    items.insert("skills".to_string(), "dir");
+    items.insert(
+        "skills/hotpot-project-onboarding/SKILL.md".to_string(),
+        "file",
+    );
+    items.insert("skill-projections/manifest.json".to_string(), "file");
+    items.insert("hotpot.json".to_string(), "file");
+    items.insert("AUTHENTICATION.md".to_string(), "file");
+    items
 }
 
 /// Minimal PATH so the real operator environment (a possibly installed real `hc`) can never
@@ -192,12 +210,11 @@ fn setup_dry_run_prints_every_planned_path_and_mutates_nothing() {
         stderr_of(&out)
     );
     let stdout = stdout_of(&out);
-    for rel in base_plan_relative_paths() {
+    for (rel, kind) in base_plan_items() {
         let abs = home.path().join(&rel);
-        let prefix = if rel.contains('.') { "file" } else { "dir" };
         assert!(
-            stdout.contains(&format!("plan: {prefix} {}", abs.display())),
-            "dry-run stdout must print planned {prefix} {rel}:\n{stdout}"
+            stdout.contains(&format!("plan: {kind} {}", abs.display())),
+            "dry-run stdout must print planned {kind} {rel}:\n{stdout}"
         );
     }
     let plan_line_count = stdout
@@ -206,7 +223,7 @@ fn setup_dry_run_prints_every_planned_path_and_mutates_nothing() {
         .count();
     assert_eq!(
         plan_line_count,
-        base_plan_relative_paths().len(),
+        base_plan_items().len(),
         "dry-run must print exactly the base plan items, no more:\n{stdout}"
     );
     assert!(
@@ -253,14 +270,16 @@ fn setup_dry_run_prints_hc_profile_change_when_fake_hc_is_on_path() {
     assert!(relative_tree(home.path()).is_empty());
 }
 
-/// Parses the absolute `plan: dir|file <path>` entries out of a dry-run stdout.
+/// Parses the absolute `plan: dir|file|link <path>` entries out of a dry-run stdout
+/// (`link` lines carry ` <path> -> <target>`; only the path is kept).
 fn planned_paths_from_dry_run(stdout: &str) -> Vec<PathBuf> {
     stdout
         .lines()
         .filter_map(|line| line.strip_prefix("plan: "))
         .filter_map(|rest| {
             let (kind, path) = rest.split_once(' ')?;
-            matches!(kind, "dir" | "file").then(|| PathBuf::from(path))
+            let path = path.split_once(" -> ").map(|(p, _)| p).unwrap_or(path);
+            matches!(kind, "dir" | "file" | "link").then(|| PathBuf::from(path))
         })
         .collect()
 }
