@@ -158,6 +158,24 @@ fn write_fake_vendor(bin_dir: &Path, vendor: &str) {
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A fake `hc` whose `run` fails after printing `stderr_line` (so the launch path's
+/// diagnostics can be asserted against real stderr text); `ls` stays scripted from
+/// `<state>/list.json` like the default fake.
+fn write_failing_run_hc(bin_dir: &Path, stderr_line: &str) {
+    let script = format!(
+        "#!/bin/sh\n\
+         state=\"$HOTPOT_FAKE_HC_STATE\"\n\
+         case \"$1\" in\n\
+           ls) exec cat \"$state/list.json\" ;;\n\
+           run) echo {stderr_line:?} >&2 ; exit 1 ;;\n\
+         esac\n\
+         exit 0\n"
+    );
+    let shim = bin_dir.join("hc");
+    fs::write(&shim, script).unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn run_hotpot(
     home: &Path,
     fake_home: &Path,
@@ -1338,5 +1356,36 @@ fn seat_launch_prompt_reports_honestly_when_no_terminal_resolves() {
             .count(),
         1,
         "the directive stays durable in the ledger"
+    );
+}
+
+/// Scope: a failing `hc run` fails the launch, and the diagnostic quotes `hc`'s own stderr
+/// verbatim — capturing it via `.output()` must not also discard it (the operator sees what
+/// the real `herdr-core` actually said, not just the exit status).
+#[test]
+fn seat_launch_surfaces_hc_run_stderr_when_the_terminal_creation_fails() {
+    let fixture = LaunchFixture::new("run-failed");
+    create_role_home(&fixture, "codex", "supervisor");
+    write_failing_run_hc(fixture.bin.path(), "hc: control socket vanished mid-handshake");
+
+    let out = fixture.launch("supervisor", "codex", &[]);
+    assert!(
+        !out.status.success(),
+        "a failed hc run must fail the launch\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("[hc-run-failed]"),
+        "the diagnostic must carry the hc-run-failed code:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("hc: control socket vanished mid-handshake"),
+        "the diagnostic must quote hc's own stderr verbatim:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exited with"),
+        "the diagnostic keeps the exit status alongside the stderr text:\n{stderr}"
     );
 }

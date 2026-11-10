@@ -437,6 +437,37 @@ fn setup_apply_notes_the_skipped_profile_change_when_hc_lacks_the_subcommand() {
     );
 }
 
+/// A genuine `hc` failure (any stderr but the unrecognized-subcommand form) must fail
+/// `setup --apply` carrying hc's own stderr text in the diagnostic — the exit status
+/// alone never hides what hc actually said.
+#[test]
+fn setup_apply_surfaces_hc_stderr_when_the_profile_change_fails() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let bin = TempDir::new("bin");
+    write_failing_hc(bin.path(), "hc: profile store is locked", 1);
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        Some(bin.path()),
+        &["setup", "--apply"],
+    );
+    assert!(
+        !out.status.success(),
+        "a failing hc profile set must fail setup --apply"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("[hc-profile-failed]"),
+        "the diagnostic must carry the hc-profile-failed code:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("hc: profile store is locked"),
+        "the diagnostic must quote hc's own stderr verbatim:\n{stderr}"
+    );
+}
+
 #[test]
 fn setup_apply_preserves_preexisting_runtime_state() {
     let home = TempDir::new("home");

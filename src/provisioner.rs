@@ -401,7 +401,8 @@ pub(crate) enum HcProfileOutcome {
 /// maintaining a global `hc profile` subcommand; when the installed `hc` reports
 /// `unrecognized subcommand 'profile'`, the step resolves to [`HcProfileOutcome::Skipped`]
 /// so `hotpot setup --apply` still succeeds on real `herdr-core` installations while fake
-/// `hc` harnesses keep being honored.
+/// `hc` harnesses keep being honored. Any other failure carries `hc`'s captured stderr in
+/// the error — the exit status alone never hides what `hc` actually said.
 fn apply_hc_profile(profile: &str, key: &str, value: &str) -> Result<HcProfileOutcome, PlanError> {
     let hc = find_on_path("hc").ok_or_else(|| {
         PlanError::new(
@@ -416,16 +417,20 @@ fn apply_hc_profile(profile: &str, key: &str, value: &str) -> Result<HcProfileOu
     if out.status.success() {
         return Ok(HcProfileOutcome::Applied);
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if stderr.contains("unrecognized subcommand 'profile'") {
         return Ok(HcProfileOutcome::Skipped);
     }
     Err(PlanError::new(
         "hc-profile-failed",
-        format!(
-            "hc profile set {profile} {key} {value} exited with {}",
-            out.status
-        ),
+        if stderr.is_empty() {
+            format!("hc profile set {profile} {key} {value} exited with {}", out.status)
+        } else {
+            format!(
+                "hc profile set {profile} {key} {value} exited with {}: {stderr}",
+                out.status
+            )
+        },
     ))
 }
 

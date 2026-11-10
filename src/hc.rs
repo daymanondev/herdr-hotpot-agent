@@ -88,6 +88,8 @@ pub fn list_terminals_strict() -> Result<Vec<HcTerminalSummary>, PlanError> {
 /// this stays a thin process bridge. When the installed `herdr-core` (`hc`) rejects `--env`
 /// on `hc run`, falls back to passing the environment pairs via `env K=V ...` after `--` and
 /// translating `--disallow-tool` to `--disallowedTools` for real `claude` CLI compatibility.
+/// Every failure path carries the captured `hc` stderr in the error — capturing it via
+/// `.output()` must not also discard it.
 pub fn run_terminal(args: &[String]) -> Result<(), PlanError> {
     let hc = hc_binary().ok_or_else(|| {
         PlanError::new(
@@ -103,26 +105,37 @@ pub fn run_terminal(args: &[String]) -> Result<(), PlanError> {
     if out.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if stderr.contains("unexpected argument '--env'") {
         let fallback = rewrite_for_herdr_core(args);
         let retry = Command::new(&hc)
             .arg("run")
             .args(&fallback)
-            .status()
+            .output()
             .map_err(|e| PlanError::new("io", format!("failed to invoke hc run: {e}")))?;
-        if retry.success() {
+        if retry.status.success() {
             return Ok(());
         }
+        let retry_stderr = String::from_utf8_lossy(&retry.stderr).trim().to_string();
         return Err(PlanError::new(
             "hc-run-failed",
-            format!("hc run exited with {retry}"),
+            hc_run_failure_detail(&retry.status, &retry_stderr),
         ));
     }
     Err(PlanError::new(
         "hc-run-failed",
-        format!("hc run exited with {}", out.status),
+        hc_run_failure_detail(&out.status, &stderr),
     ))
+}
+
+/// The `hc-run-failed` diagnostic: the exit status plus `hc`'s own stderr when it said
+/// anything (an empty stderr never trails a dangling separator).
+fn hc_run_failure_detail(status: &std::process::ExitStatus, stderr: &str) -> String {
+    if stderr.is_empty() {
+        format!("hc run exited with {status}")
+    } else {
+        format!("hc run exited with {status}: {stderr}")
+    }
 }
 
 /// Rewrites `hc run` argv carrying `--env K=V ... -- <vendor> ...` into
