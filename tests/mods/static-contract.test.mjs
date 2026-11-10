@@ -80,3 +80,43 @@ test("the right-hand panel carries no emoji, block bars, ALL-CAPS headings, or p
   const source = readFileSync(PANEL_SOURCE_URL, "utf8");
   assert.deepEqual(panelHygieneOffenders(source), []);
 });
+
+// ---------------------------------------------------------------------------
+// Ticket 06: the panel's native design system at the rendering boundary —
+// the geometric context bar (a 3px track with a 1px rotation tick), the
+// native spinner, and vendor icons resolved through Herdr's `knownAgents()`
+// registry (the `image()` branch renders untinted vendor icons; `svg()` the
+// tinted ones). Text stand-ins are gone: no `BAR_CELLS` cell rendering, no
+// braille spinner frames, no `●` text dots.
+// ---------------------------------------------------------------------------
+
+const NATIVE_CHROME_REQUIRED = [
+  [".h(3)", "the 3px context-bar track"],
+  [".w(1)", "the 1px rotation tick"],
+  ["spinner.svg", "the native spinner glyph"],
+  [".spin(", "the spinner's native spin (its 900ms cadence is pinned by the marker model tests)"],
+  ["knownAgents(", "Herdr's agent registry"],
+  ["image(", "the untinted vendor-icon branch"],
+];
+
+const NATIVE_CHROME_FORBIDDEN = [
+  [/BAR_CELLS/, "the ASCII cell-bar constant"],
+  [/⠋/, "a text spinner frame"],
+  [/●/, "a text status dot"],
+];
+
+test("the panel renders the native chrome pieces the design system names", () => {
+  const source = readFileSync(PANEL_SOURCE_URL, "utf8");
+  const missing = NATIVE_CHROME_REQUIRED.filter(([needle]) => !source.includes(needle)).map(
+    ([, label]) => label,
+  );
+  assert.deepEqual(missing, [], "every native chrome piece is rendered");
+});
+
+test("the panel leaves no text stand-ins for the native markers and bars", () => {
+  const source = readFileSync(PANEL_SOURCE_URL, "utf8");
+  const offenders = NATIVE_CHROME_FORBIDDEN.filter(([pattern]) => pattern.test(source)).map(
+    ([, label]) => label,
+  );
+  assert.deepEqual(offenders, [], "no text stand-in survives");
+});

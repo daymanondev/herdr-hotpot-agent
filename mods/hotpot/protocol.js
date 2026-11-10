@@ -399,6 +399,105 @@ export function seatSlotsModel(snapshot) {
   return model;
 }
 
+/** Apply one selector pick to a draft `agent/model/thinking` selection: the
+ * patch wins per field, and a family change that leaves a model the new
+ * family does not offer resets the model to the family's first option. A
+ * patch naming an unknown family throws before anything execs. The mod
+ * persists the returned selection immediately through `profileSetArgs`. */
+export function applyPickerPatch(draft, patch) {
+  const next = { ...draft, ...patch };
+  if (!MODEL_OPTIONS[next.agent]) {
+    throw new Error(`invalid agent \`${next.agent}\`: permitted values are ${AGENT_OPTIONS.join("|")}`);
+  }
+  if (!MODEL_OPTIONS[next.agent].includes(next.model)) {
+    next.model = MODEL_OPTIONS[next.agent][0];
+  }
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// Native panel chrome: vendor icons and geometric state markers
+// (ticket nui/06)
+// ---------------------------------------------------------------------------
+
+// The chrome fallback every seat renders when Herdr's program table has no
+// entry (or no icon) for the agent: the terminal glyph, a one-color svg.
+export const AGENT_ICON_FALLBACK = {
+  kind: "fallback",
+  icon: "mods/workspace-chrome/terminal.svg",
+  tint: true,
+};
+
+/** The icon descriptor one seat or peer row renders for its agent: the
+ * vendor icon Herdr's `knownAgents()` registry reports (`svg(icon)` tinted
+ * when `tint`, else the full-color `image(icon)`), or the terminal fallback
+ * when the registry lacks the agent or an icon for it. Pure over the
+ * registry so the tint rule stays node-testable outside herdr. */
+export function agentIconModel(agent, registry) {
+  const entries = Array.isArray(registry) ? registry : [];
+  const program = entries.find(
+    (entry) =>
+      entry &&
+      typeof entry === "object" &&
+      entry.key === agent &&
+      typeof entry.icon === "string" &&
+      entry.icon !== "",
+  );
+  if (!program) return { ...AGENT_ICON_FALLBACK };
+  return { kind: "vendor", icon: program.icon, tint: Boolean(program.tint) };
+}
+
+/** The quiet geometric state marker one seat row renders for its status
+ * (spec "Native Herdr GPUI Design System"): a spinning `spinner.svg` while
+ * the turn is active, a `7px` ring for `idle`, a `7px` filled dot for `done`,
+ * a `7px` dimmed dot for `unlaunched` slots, and a tinted `!` badge for
+ * `blocked`. Unknown statuses stay a neutral ring — never an exception
+ * color. The marker's `tone` carries the color intent; `markerToneColor`
+ * resolves it against a theme. */
+export function seatStatusMarker(status) {
+  switch (status) {
+    case "working":
+    case "running":
+    case "live":
+    case "busy":
+      return {
+        kind: "spinner",
+        icon: "mods/workspace-chrome/spinner.svg",
+        spinMs: 900,
+        tone: "working",
+      };
+    case "idle":
+      return { kind: "ring", size: 7, tone: "idle" };
+    case "done":
+      return { kind: "dot", size: 7, tone: "done" };
+    case "unlaunched":
+      return { kind: "dot", size: 7, tone: "dim" };
+    case "blocked":
+      return { kind: "badge", glyph: "!", tone: "warning" };
+    default:
+      return { kind: "ring", size: 7, tone: "neutral" };
+  }
+}
+
+/** The theme color of one marker tone: the working accent while a turn is
+ * active, the quiet dim/idle greys at rest, and the warning tint only for
+ * the exception (`blocked` / the `!` badge). Falls back through the same
+ * theme keys `statusColor` uses, so sparse theme fixtures stay total. */
+export function markerToneColor(themeObj, tone) {
+  switch (tone) {
+    case "working":
+      return themeObj.working ?? themeObj.accent;
+    case "done":
+      return themeObj.done ?? themeObj.ansi2;
+    case "warning":
+      return themeObj.blocked ?? themeObj.ansi1;
+    case "dim":
+      return themeObj.dim;
+    default:
+      return themeObj.idle ?? themeObj.dim;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Panel restructure: Quiet When Quiet, Start, preset menu, peer tree
 // (ticket nui/05)

@@ -1,5 +1,6 @@
-// Right-hand Hotpot panel: Seat Slots, peer tree, header presets, and strict
-// *Quiet When Quiet* ergonomics (ticket 05).
+// Right-hand Hotpot panel: Seat Slots, peer tree, header presets, strict
+// *Quiet When Quiet* ergonomics (ticket 05), and Herdr's native visual system
+// (ticket 06).
 //
 // The panel always shows the Project's Supervisor and Lead Seat Slots — live
 // seat data when running, the role's configured profile defaults plus a
@@ -11,10 +12,28 @@
 // chevrons and right-aligned counts, over the live `hotpot status` snapshot
 // (streamed in through `watchFolder` on the runtime root, with a slow timer
 // fallback for changes that have no file event).
+//
+// Every row speaks the native design system: vendor icons resolved from
+// Herdr's `knownAgents()` registry (tinted `svg` glyphs or full-color
+// `image`s, the terminal glyph as fallback), quiet geometric state markers
+// (a spinning `spinner.svg` while working, rings and dots at rest, a tinted
+// `!` badge when blocked), a `3px` geometric context bar with a `1px`
+// warning tick at the `150k` rotation mark, and a non-truncating
+// `agent / model · thinking` selector that persists each click immediately.
 
-import { View, div, svg } from "gpui-kit";
+import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { exec, spaces, theme, run, shared, setShared, home, watchFolder } from "herdr";
+import {
+  exec,
+  spaces,
+  theme,
+  run,
+  shared,
+  setShared,
+  home,
+  watchFolder,
+  knownAgents,
+} from "herdr";
 import {
   HOTPOT_SELECTED_KEY,
   HOTPOT_VIEW_MODE_KEY,
@@ -23,9 +42,14 @@ import {
   MODEL_OPTIONS,
   THINKING_OPTIONS,
   PRESET_PROFILES,
+  ROTATION_MARK_TOKENS,
   activeSpace,
   spaceFolder,
   hotpotExecOptions,
+  agentIconModel,
+  applyPickerPatch,
+  seatStatusMarker,
+  markerToneColor,
   attentionView,
   contextBarModel,
   formatTokenCount,
@@ -58,6 +82,21 @@ export default class HotpotPanel extends View {
     this.presetMenuOpen = false;
     // The seat role whose `Start` sequence is currently exec-ing.
     this.starting = null;
+    // Herdr's program table (`knownAgents()`): the vendor icon registry the
+    // seat and peer rows resolve their agent icons against, asked for once
+    // per panel. A rejected ask leaves it empty — every icon then falls back
+    // to the terminal glyph.
+    this.agentRegistry = [];
+    cx.spawn(async (taskCx) => {
+      try {
+        this.agentRegistry = await knownAgents({
+          on: activeSpace(spaces())?.machine ?? null,
+        });
+      } catch {
+        this.agentRegistry = [];
+      }
+      taskCx.notify();
+    });
     // Fallback cadence only: ledger changes stream in through `watchRuntime`
     // (`watchFolder` on Hotpot Home's runtime root, spec "Implementation
     // Decisions"; ADR 0001). The timer covers what has no file event — `hc`
@@ -252,6 +291,61 @@ export default class HotpotPanel extends View {
       });
   }
 
+  // The agent's icon from Herdr's program table (`knownAgents()`): a
+  // one-color glyph drawn in the row's color when the entry tints, else the
+  // vendor's own full-color picture. Agents the registry lacks — or slots
+  // with no configured agent yet — fall back to the terminal glyph.
+  vendorIcon(t, agent, size = 13) {
+    const icon = agentIconModel(agent, this.agentRegistry);
+    if (icon.tint) {
+      return svg(icon.icon).size(size).flex_none().text_color(t.foreground);
+    }
+    return image(icon.icon).w(size).h(size).flex_none();
+  }
+
+  // The quiet geometric state marker of one seat row (spec "Native Herdr
+  // GPUI Design System"): a spinning glyph while the turn is active, a ring
+  // at rest, filled and dimmed dots for done and unlaunched, and the tinted
+  // `!` badge when blocked. Unknown statuses stay neutral.
+  renderStatusMarker(t, status) {
+    const marker = seatStatusMarker(status);
+    const color = markerToneColor(t, marker.tone);
+    if (marker.kind === "spinner") {
+      return svg(marker.icon).size(11).flex_none().spin(marker.spinMs).text_color(color);
+    }
+    if (marker.kind === "ring") {
+      return div()
+        .id(`marker-ring-${marker.tone}`)
+        .w(marker.size)
+        .h(marker.size)
+        .rounded(4)
+        .border(1)
+        .border_color(color)
+        .flex_none();
+    }
+    if (marker.kind === "dot") {
+      return div()
+        .id(`marker-dot-${marker.tone}`)
+        .w(marker.size)
+        .h(marker.size)
+        .rounded(4)
+        .bg(color)
+        .flex_none();
+    }
+    return div()
+      .id(`marker-badge-${marker.tone}`)
+      .w(13)
+      .h(13)
+      .rounded(4)
+      .bg(color)
+      .flex_none()
+      .items_center()
+      .justify_center()
+      .child(
+        div().text_size(10).font_semibold().text_color(t.solid_foreground).child(marker.glyph),
+      );
+  }
+
   // ---------------------------------------------------------------------------
   // Attention (pinned on top; quiet collapses to the All clear indicator)
   // ---------------------------------------------------------------------------
@@ -336,122 +430,200 @@ export default class HotpotPanel extends View {
     clickCx.notify();
   }
 
-  pick(field, value, clickCx) {
+  // One selection inside the pill's selector: apply the picked patch to the
+  // draft (the pure `applyPickerPatch` resets the model when the family
+  // changes under it) and persist the resulting selection immediately
+  // through the minimal `hotpot profile set` write path — the selector has
+  // no separate apply step.
+  pick(cx, slot, patch, clickCx) {
     if (!this.picker) return;
-    this.picker[field] = value;
-    if (field === "agent" && !MODEL_OPTIONS[value].includes(this.picker.model)) {
-      this.picker.model = MODEL_OPTIONS[value][0];
+    try {
+      this.picker = applyPickerPatch(this.picker, patch);
+    } catch {
+      return; // an invalid payload never reaches the engine
     }
     clickCx.notify();
+    const { agent, model, thinking } = this.picker;
+    this.runProfileSet(cx, agent, slot.role, model, thinking);
   }
 
-  renderPickerChips(t, options, field, current) {
-    return h_flex().gap(4).flex_wrap().children([
-      ...options.map((option) =>
+  // One agent family row in the selector: the family's native vendor icon
+  // with its name, marked with the check glyph when it is the draft's
+  // family. Clicking it switches the family (and its default model) and
+  // persists at once.
+  renderAgentFamily(t, cx, slot, agent) {
+    const selected = this.picker?.agent === agent;
+    return h_flex()
+      .id(`pick-agent-${agent}`)
+      .items_center()
+      .gap(6)
+      .h(22)
+      .px(4)
+      .rounded(6)
+      .when(selected, (el) => el.bg(t.selected))
+      .hover((s) => s.bg(t.hover))
+      .on_click((_e, clickCx) => {
+        clickCx.stop_propagation();
+        this.pick(cx, slot, { agent }, clickCx);
+      })
+      .children(
+        [
+          this.vendorIcon(t, agent, 13),
+          div()
+            .text_size(11)
+            .font_semibold()
+            .text_color(selected ? t.foreground : t.muted)
+            .child(agent),
+          div().flex_1(),
+          selected
+            ? svg("mods/workspace-chrome/check.svg").size(10).flex_none().text_color(t.accent)
+            : null,
+        ].filter(Boolean),
+      );
+  }
+
+  // One model row in the selector, indented under its family and spelled in
+  // full — the selector never truncates. The dot marks the draft's model.
+  renderModelOption(t, cx, slot, agent, model) {
+    const selected = this.picker?.agent === agent && this.picker?.model === model;
+    return h_flex()
+      .id(`pick-model-${agent}-${model}`)
+      .items_center()
+      .gap(5)
+      .h(20)
+      .pl(22)
+      .rounded(6)
+      .when(selected, (el) => el.bg(t.selected))
+      .hover((s) => s.bg(t.hover))
+      .on_click((_e, clickCx) => {
+        clickCx.stop_propagation();
+        this.pick(cx, slot, { agent, model }, clickCx);
+      })
+      .children([
         div()
-          .id(`pick-${field}-${option}`)
-          .px(6)
-          .py(2)
-          .rounded(8)
-          .bg(option === current ? t.selected : t.raised)
-          .border(1)
-          .border_color(option === current ? t.accent : t.border)
-          .text_size(10)
-          .text_color(option === current ? t.accent : t.muted)
-          .child(option)
-          .on_click((_e, clickCx) => {
-            clickCx.stop_propagation();
-            this.pick(field, option, clickCx);
-          }),
-      ),
-    ]);
+          .w(7)
+          .h(7)
+          .rounded(4)
+          .flex_none()
+          .when(selected, (el) => el.bg(t.accent)),
+        div()
+          .text_size(10.5)
+          .text_color(selected ? t.foreground : t.muted)
+          .child(model),
+      ]);
   }
 
+  // The selector's thinking row: the permitted `low|medium|high` efforts as
+  // chips (refused `ultra`/`ultracode` never appear), each click persisting
+  // at once.
+  renderThinkingChips(t, cx, slot) {
+    return h_flex()
+      .items_center()
+      .gap(4)
+      .flex_wrap()
+      .children([
+        div().text_size(10).font_semibold().text_color(t.dim).child("thinking"),
+        ...THINKING_OPTIONS.map((option) => {
+          const selected = option === this.picker?.thinking;
+          return div()
+            .id(`pick-thinking-${option}`)
+            .px(6)
+            .py(2)
+            .rounded(8)
+            .bg(selected ? t.selected : t.raised)
+            .border(1)
+            .border_color(selected ? t.accent : t.border)
+            .text_size(10)
+            .text_color(selected ? t.accent : t.muted)
+            .child(option)
+            .on_click((_e, clickCx) => {
+              clickCx.stop_propagation();
+              this.pick(cx, slot, { thinking: option }, clickCx);
+            });
+        }),
+      ]);
+  }
+
+  // The pill's selector: every agent family with its native vendor icon and
+  // each of its models in full, plus the thinking efforts. Each click
+  // persists immediately; nothing truncates.
   renderSeatPicker(t, slot, cx) {
     if (!this.picker) return null;
     return v_flex()
       .id(`picker-${slot.role}`)
       .p(6)
-      .gap(4)
+      .gap(2)
       .rounded(6)
       .bg(t.canvas)
       .border(1)
       .border_color(t.border)
       .children([
-        div().text_size(10).font_semibold().text_color(t.dim).child("agent"),
-        this.renderPickerChips(t, AGENT_OPTIONS, "agent", this.picker.agent),
-        div().text_size(10).font_semibold().text_color(t.dim).child("model"),
-        this.renderPickerChips(t, MODEL_OPTIONS[this.picker.agent], "model", this.picker.model),
-        div().text_size(10).font_semibold().text_color(t.dim).child("thinking"),
-        this.renderPickerChips(t, THINKING_OPTIONS, "thinking", this.picker.thinking),
-        h_flex()
-          .gap(6)
-          .children([
-            div()
-              .id(`picker-apply-${slot.role}`)
-              .px(8)
-              .py(3)
-              .rounded(6)
-              .bg(t.solid)
-              .text_size(10)
-              .font_semibold()
-              .text_color(t.solid_foreground)
-              .child(`Apply to ${slot.role} default ✓`)
-              .on_click((_e, clickCx) => {
-                clickCx.stop_propagation();
-                const { agent, model, thinking } = this.picker ?? {};
-                this.pickerFor = null;
-                this.picker = null;
-                clickCx.notify();
-                this.runProfileSet(cx, agent, slot.role, model, thinking);
-              }),
-            div()
-              .id(`picker-cancel-${slot.role}`)
-              .px(8)
-              .py(3)
-              .rounded(6)
-              .bg(t.raised)
-              .text_size(10)
-              .text_color(t.muted)
-              .child("✕")
-              .on_click((_e, clickCx) => {
-                clickCx.stop_propagation();
-                this.pickerFor = null;
-                this.picker = null;
-                clickCx.notify();
-              }),
-          ]),
+        ...AGENT_OPTIONS.flatMap((agent) => [
+          this.renderAgentFamily(t, cx, slot, agent),
+          ...MODEL_OPTIONS[agent].map((model) =>
+            this.renderModelOption(t, cx, slot, agent, model),
+          ),
+        ]),
+        div().h(2),
+        this.renderThinkingChips(t, cx, slot),
       ]);
   }
 
+  // The seat's context window as one geometric bar (spec "Geometric Context
+  // Bar"): a `3px` rounded track carrying proportional `Cache Read` /
+  // `Fresh Input` / `Output` fills, a `1px` warning-colored tick at the
+  // rotation mark's share of the track, and the compact `150k` badge once
+  // usage reaches the mark. The quiet token total stays on the right.
   renderContextBar(t, context) {
     const bar = contextBarModel(context);
+    const segmentColors = { cacheRead: t.muted, freshInput: t.accent, output: t.dim };
     return h_flex()
       .id("seat-context-bar")
       .items_center()
-      .gap(3)
+      .gap(4)
       .children(
         [
           div()
-            .text_size(10)
-            .text_color(t.dim)
-            .truncate()
-            .child(
-              bar.segments
-                .map((segment) => `${formatTokenCount(segment.value)} ${segment.label}`)
-                .join(" · "),
+            .id("context-bar-track")
+            .relative()
+            .flex_1()
+            .h(3)
+            .rounded(1.5)
+            .overflow_hidden()
+            .bg(t.canvas)
+            .children(
+              [
+                ...bar.segments
+                  .filter((segment) => segment.fraction > 0)
+                  .map((segment) =>
+                    div()
+                      .id(`context-bar-${segment.kind}`)
+                      .h(3)
+                      .flex_grow(segment.fraction)
+                      .bg(segmentColors[segment.kind] ?? t.dim),
+                  ),
+                bar.rotationTick
+                  ? div()
+                      .id("bar-rotation-tick")
+                      .absolute()
+                      .top(0)
+                      .bottom(0)
+                      .w(1)
+                      .left(`${((100 * ROTATION_MARK_TOKENS) / bar.total).toFixed(2)}%`)
+                      .bg(warningColor(t))
+                  : null,
+              ].filter(Boolean),
             ),
-          div().flex_1(),
           bar.rotationTick
             ? div()
-                .id("bar-rotation-tick")
+                .id("bar-rotation-badge")
                 .px(4)
                 .rounded(4)
                 .bg(t.raised)
                 .text_size(10)
                 .font_semibold()
                 .text_color(warningColor(t))
-                .child(`⟳ rotate ${formatTokenCount(bar.total)}`)
+                .child(formatTokenCount(ROTATION_MARK_TOKENS))
             : null,
           div().text_size(10).text_color(t.muted).child(formatTokenCount(bar.total)),
         ].filter(Boolean),
@@ -513,13 +685,8 @@ export default class HotpotPanel extends View {
               .items_center()
               .gap(6)
               .children([
-                div()
-                  .text_size(11)
-                  .text_color(statusColor(t, slot.status))
-                  .when(slot.status === "working", (el) =>
-                    el.frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90),
-                  )
-                  .when(slot.status !== "working", (el) => el.child("●")),
+                this.renderStatusMarker(t, slot.status),
+                this.vendorIcon(t, slot.agent),
                 div().text_size(13).font_semibold().text_color(t.foreground).child(slot.title),
                 div()
                   .px(5)
@@ -594,6 +761,7 @@ export default class HotpotPanel extends View {
       .children(
         [
           div().w(10).flex_none().text_color(t.dim).child(peer.connector),
+          this.vendorIcon(t, peer.agent, 11),
           div()
             .text_size(11)
             .font_semibold()
