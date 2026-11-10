@@ -10,12 +10,16 @@
 //! strictly `ask`/`handoff` with identity, assignment, and workspace derived
 //! server-side from the session correlation (never from tool arguments), and
 //! every writable `handoff` validated against live Git `baseCommit..Candidate`
-//! evidence (see [`evidence`]). Detached gate execution and supervisor tool
-//! semantics land with their own runtime slices.
+//! evidence (see [`evidence`]). `gate_run` re-executes the Gate against the
+//! handed-back candidate in a detached background process whose completion is
+//! recorded as a ledger event with a masked red tail (see [`gate`] and
+//! [`masking`]); nothing is ever auto-accepted on a green gate.
 
 pub mod evidence;
+pub mod gate;
 pub mod ledger;
 pub mod leases;
+pub mod masking;
 
 pub use ledger::{Ledger, project_slug, sha1_hex};
 pub use leases::{IN_CHECKOUT_EXCLUSIVE, WriterLease};
@@ -108,7 +112,7 @@ pub fn role_tool_defs(role: Role) -> Vec<Value> {
             ),
             (
                 "assignment_dispatch",
-                "Dispatch a Draft Assignment to a Peer, registering its correlation -> (project, assignment, workspace) binding.",
+                "Dispatch a Draft Assignment to a Peer, registering its correlation -> (project, assignment, workspace) binding; optionally request the seat's agent family and model (e.g. a Reviewer from a different family).",
             ),
             (
                 "assignment_status",
@@ -128,7 +132,7 @@ pub fn role_tool_defs(role: Role) -> Vec<Value> {
             ),
             (
                 "gate_run",
-                "Start the Assignment Gate against its Candidate (execution is delivered by the detached Gate runner).",
+                "Re-execute the Assignment Gate against its Candidate in a detached background process; the completion verdict (green, red with a masked tail, or uncertain) is recorded as a ledger event.",
             ),
             (
                 "workspace_close",
@@ -207,7 +211,7 @@ pub fn serve_mcp(
         if raw.trim().is_empty() {
             continue;
         }
-        if let Some(reply) = handle_line(&ledger, role, project_root, correlation, &raw) {
+        if let Some(reply) = handle_line(&ledger, role, project_root, state_dir, correlation, &raw) {
             let _ = writeln!(stdout, "{reply}");
             let _ = stdout.flush();
         }
@@ -220,6 +224,7 @@ fn handle_line(
     ledger: &Ledger,
     role: Role,
     project_root: &Path,
+    state_dir: &Path,
     correlation: Option<&str>,
     raw: &str,
 ) -> Option<Value> {
@@ -271,7 +276,7 @@ fn handle_line(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match call_tool(ledger, project_root, correlation, name, &arguments) {
+            match call_tool(ledger, project_root, state_dir, correlation, name, &arguments) {
                 Ok(result) => Some(rpc_response(id, result)),
                 Err(e) => Some(rpc_error_response(id, e.code, &e.message)),
             }
@@ -293,6 +298,7 @@ fn handle_line(
 fn call_tool(
     ledger: &Ledger,
     project_root: &Path,
+    state_dir: &Path,
     correlation: Option<&str>,
     tool: &str,
     args: &Value,
@@ -304,9 +310,10 @@ fn call_tool(
         "assignment_answer" => assignment_answer(ledger, args),
         "assignment_accept" => assignment_accept(ledger, args),
         "assignment_close" => assignment_close(ledger, args),
-        "gate_run" => gate_run(ledger, args),
+        "gate_run" => gate_run(ledger, project_root, state_dir, args),
         "workspace_close" => workspace_close(ledger, project_root, args),
         "lease_reclaim" => lease_reclaim(ledger, args),
+        "runtime_findings" => runtime_findings(ledger),
         "ask" => peer_ask(ledger, correlation, args),
         "handoff" => peer_handoff(ledger, correlation, args),
         _ => Err(RpcError::not_implemented(format!(
@@ -341,6 +348,11 @@ pub const DISPOSITIONS: &[&str] = &["Engineer", "Architect", "Reviewer", "Scout"
 pub const THINKING_EFFORTS: &[&str] = &["low", "medium", "high"];
 pub const REFUSED_THINKING_EFFORTS: &[&str] = &["ultra", "ultracode"];
 
+/// The verified seat agent families a dispatch may request (a Reviewer may be
+/// dispatched on a different family than the engineer whose candidate it
+/// reviews); anything else is refused.
+pub const AGENT_FAMILIES: &[&str] = &["codex", "claude", "pi"];
+
 /// One `Assignment` (`asg_<id>`) as projected from the ledger.
 #[derive(Debug, Clone)]
 pub struct Assignment {
@@ -356,6 +368,12 @@ pub struct Assignment {
     pub thinking_reason: Option<String>,
     pub correlation: Option<String>,
     pub workspace: Option<String>,
+    /// The dispatched seat's agent family (`codex`|`claude`|`pi`), when Lead
+    /// requested one (a Reviewer may run on a different family than the
+    /// engineer whose candidate it reviews).
+    pub agent: Option<String>,
+    /// The dispatched seat's free-form model id, when Lead requested one.
+    pub model: Option<String>,
     /// The Lead's latest `assignment_answered` text, visible to the Peer seat.
     pub last_answer: Option<String>,
     /// The verified `Candidate` commit of the latest accepted handback.
@@ -363,10 +381,17 @@ pub struct Assignment {
     /// Unix-seconds timestamp of the handback that is still unread by the Lead
     /// (feeds the unread-handback Attention Letter).
     pub handed_back_at: Option<u64>,
+    /// Verdict of the latest completed `gate_run` (`green`|`red`|`uncertain`).
+    pub gate_verdict: Option<String>,
+    /// Path of the masked red tail of the latest completed `gate_run`.
+    pub gate_tail: Option<String>,
+    /// Uncertain reason (`timeout`, `spawn-failed`, ...) of the latest gate run.
+    pub gate_reason: Option<String>,
 }
 
 impl Assignment {
-    fn to_json(&self) -> Value {
+    /// The assignment as served by `assignment_status` (and `hotpot export`).
+    pub fn to_json(&self) -> Value {
         json!({
             "id": self.id,
             "state": self.state,
@@ -380,9 +405,14 @@ impl Assignment {
             "thinkingReason": self.thinking_reason,
             "correlation": self.correlation,
             "workspace": self.workspace,
+            "agent": self.agent,
+            "model": self.model,
             "lastAnswer": self.last_answer,
             "candidate": self.candidate,
             "handedBackAt": self.handed_back_at,
+            "gateVerdict": self.gate_verdict,
+            "gateTail": self.gate_tail,
+            "gateReason": self.gate_reason,
         })
     }
 }
@@ -412,6 +442,11 @@ impl RuntimeState {
 
     pub fn assignment(&self, id: &str) -> Option<&Assignment> {
         self.assignments.get(id)
+    }
+
+    /// Every projected assignment in id order (used by `hotpot export`).
+    pub fn assignments(&self) -> Vec<&Assignment> {
+        self.assignments.values().collect()
     }
 
     /// The active Writer Lease held for `assignment`, if any.
@@ -450,9 +485,14 @@ impl RuntimeState {
                         thinking_reason: opt_str_field(event, "thinkingReason"),
                         correlation: None,
                         workspace: None,
+                        agent: None,
+                        model: None,
                         last_answer: None,
                         candidate: None,
                         handed_back_at: None,
+                        gate_verdict: None,
+                        gate_tail: None,
+                        gate_reason: None,
                     },
                 );
             }
@@ -475,6 +515,8 @@ impl RuntimeState {
                 if let Some(a) = self.assignments.get_mut(id) {
                     a.correlation = opt_str_field(event, "correlation");
                     a.workspace = opt_str_field(event, "workspace");
+                    a.agent = opt_str_field(event, "agent");
+                    a.model = opt_str_field(event, "model");
                     if let Some(next) = transition(&a.state, kind) {
                         a.state = next.to_string();
                     }
@@ -497,6 +539,27 @@ impl RuntimeState {
                     }
                 }
             }
+            "gate_started" => {
+                // A new gate run supersedes any recorded verdict while it runs.
+                if let Some(a) = self.assignments.get_mut(id) {
+                    a.gate_verdict = None;
+                    a.gate_tail = None;
+                    a.gate_reason = None;
+                    if let Some(next) = transition(&a.state, kind) {
+                        a.state = next.to_string();
+                    }
+                }
+            }
+            "gate_completed" => {
+                if let Some(a) = self.assignments.get_mut(id) {
+                    a.gate_verdict = opt_str_field(event, "verdict");
+                    a.gate_tail = opt_str_field(event, "tail");
+                    a.gate_reason = opt_str_field(event, "reason");
+                    if let Some(next) = transition(&a.state, kind) {
+                        a.state = next.to_string();
+                    }
+                }
+            }
             _ => {
                 if let Some(a) = self.assignments.get_mut(id)
                     && let Some(next) = transition(&a.state, kind)
@@ -512,6 +575,9 @@ impl RuntimeState {
 /// `Draft -> Dispatched -> Asking | HandedBack | Stopped`;
 /// `HandedBack -> GateRunning (optional) -> Accepted | ReworkRequested | Rejected | Abandoned`;
 /// `Accepted | Rejected | Abandoned -> Closed`.
+/// A completed gate returns the assignment to `HandedBack` carrying its
+/// verdict — acceptance stays an explicit Lead transition (`assignment_accept`
+/// also legal straight out of `GateRunning`), so nothing is auto-accepted.
 /// Returns the next state when `kind` is a legal transition from `state`.
 fn transition(state: &str, kind: &str) -> Option<&'static str> {
     match (state, kind) {
@@ -522,6 +588,7 @@ fn transition(state: &str, kind: &str) -> Option<&'static str> {
         | ("Asking", "assignment_handed_back")
         | ("ReworkRequested", "assignment_handed_back") => Some("HandedBack"),
         ("HandedBack", "gate_started") => Some("GateRunning"),
+        ("GateRunning", "gate_completed") => Some("HandedBack"),
         ("HandedBack", "assignment_accepted") | ("GateRunning", "assignment_accepted") => {
             Some("Accepted")
         }
@@ -785,6 +852,48 @@ fn assignment_dispatch(
     let asg = require_assignment(ledger, TOOL, &id)?;
     require_state(TOOL, "dispatch", &asg, &["Draft"])?;
 
+    // The optional seat family / model this peer runs on (e.g. a Reviewer from
+    // a different family than the engineer whose candidate it reviews).
+    let agent = match args.get("agent") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let requested = s.trim();
+            let family = AGENT_FAMILIES
+                .iter()
+                .find(|f| f.eq_ignore_ascii_case(requested))
+                .ok_or_else(|| {
+                    RpcError::invalid_params(format!(
+                        "{TOOL}: invalid agent family `{requested}`: the verified seat families are {}",
+                        AGENT_FAMILIES.join("|")
+                    ))
+                })?;
+            Some(family.to_string())
+        }
+        Some(_) => {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: `agent` must be a seat family string ({})",
+                AGENT_FAMILIES.join("|")
+            )))
+        }
+    };
+    let model = match args.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let requested = s.trim();
+            if requested.is_empty() {
+                return Err(RpcError::invalid_params(format!(
+                    "{TOOL}: `model` must be a non-empty model id string"
+                )));
+            }
+            Some(requested.to_string())
+        }
+        Some(_) => {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: `model` must be a non-empty model id string"
+            )))
+        }
+    };
+
     // Writability is declared by a non-empty Write Scope: read-only assignments
     // (e.g. a Reviewer) acquire no Writer Lease and never touch the checkout.
     let writable = !asg.write_scope.is_empty();
@@ -880,13 +989,20 @@ fn assignment_dispatch(
             }),
     };
 
+    let mut dispatch_event = json!({
+        "type": "assignment_dispatched",
+        "assignment": id,
+        "correlation": correlation,
+        "workspace": workspace,
+    });
+    if let Some(agent) = &agent {
+        dispatch_event["agent"] = json!(agent);
+    }
+    if let Some(model) = &model {
+        dispatch_event["model"] = json!(model);
+    }
     ledger
-        .append(json!({
-            "type": "assignment_dispatched",
-            "assignment": id,
-            "correlation": correlation,
-            "workspace": workspace,
-        }))
+        .append(dispatch_event)
         .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
     if writable {
         let event = match &provision {
@@ -926,9 +1042,12 @@ fn assignment_dispatch(
     Ok(result)
 }
 
-/// `workspace_close`: release the assignment's Writer Lease and clean/retain its
-/// isolated worktree per assignment state — a handed-back candidate (evidence
-/// awaiting manual integration) is retained, anything else is cleaned up.
+/// `workspace_close`: archive the assignment's workspace — release its Writer
+/// Lease, clean/retain its isolated worktree per assignment state (a handed-back
+/// candidate awaiting manual integration is retained, anything else is cleaned
+/// up), and finalize a terminal disposition (`Accepted` | `Rejected` |
+/// `Abandoned`) as `Closed` per the state machine. Read-only assignments hold
+/// no workspace resources, so closing them only finalizes the state.
 fn workspace_close(
     ledger: &Ledger,
     project_root: &Path,
@@ -937,20 +1056,17 @@ fn workspace_close(
     const TOOL: &str = "workspace_close";
     let id = arg_str(args, TOOL, "assignment")?;
     let state = RuntimeState::load(ledger);
-    let lease = state
-        .lease_for(&id)
-        .ok_or_else(|| {
-            RpcError::invalid_params(format!(
-                "{TOOL}: no active writer lease for `{id}`; workspace_close releases a lease held by a dispatched assignment"
-            ))
-        })?
-        .clone();
-    let asg = state
-        .assignment(&id)
-        .expect("a lease only exists for a recorded assignment")
-        .clone();
+    let lease = state.lease_for(&id).cloned();
+    let asg = require_assignment(ledger, TOOL, &id)?;
+    let terminal = ["Accepted", "Rejected", "Abandoned"].contains(&asg.state.as_str());
+    if lease.is_none() && !terminal {
+        return Err(RpcError::invalid_params(format!(
+            "{TOOL}: no active writer lease for `{id}`; workspace_close releases a lease held by a dispatched assignment"
+        )));
+    }
 
-    let action = if lease.mode == leases::ISOLATED_WORKTREE
+    let action = if let Some(lease) = &lease
+        && lease.mode == leases::ISOLATED_WORKTREE
         && let Some(worktree) = &lease.worktree
     {
         if ["HandedBack", "GateRunning"].contains(&asg.state.as_str()) {
@@ -963,19 +1079,30 @@ fn workspace_close(
         "none"
     };
 
-    ledger
-        .append(json!({
-            "type": "writer_lease_released",
-            "assignment": id,
-            "worktreeAction": action,
-        }))
-        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    if lease.is_some() {
+        ledger
+            .append(json!({
+                "type": "writer_lease_released",
+                "assignment": id,
+                "worktreeAction": action,
+            }))
+            .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    }
+    // The peer workspace is archived; a terminal disposition becomes Closed.
+    if terminal {
+        ledger
+            .append(json!({"type": "assignment_closed", "assignment": id}))
+            .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
+    }
     let state = RuntimeState::load(ledger);
     let mut result = state
         .assignment(&id)
         .expect("assignment exists before its lifecycle event")
         .to_json();
-    result["lease"] = json!({"released": true, "worktreeAction": action});
+    result["lease"] = json!({
+        "released": lease.is_some(),
+        "worktreeAction": action,
+    });
     Ok(result)
 }
 
@@ -1068,26 +1195,90 @@ fn assignment_close(ledger: &Ledger, args: &Value) -> Result<Value, RpcError> {
     append_and_reload(ledger, TOOL, json!({"type": kind, "assignment": id}))
 }
 
-fn gate_run(ledger: &Ledger, args: &Value) -> Result<Value, RpcError> {
+fn gate_run(
+    ledger: &Ledger,
+    project_root: &Path,
+    state_dir: &Path,
+    args: &Value,
+) -> Result<Value, RpcError> {
     const TOOL: &str = "gate_run";
     let id = arg_str(args, TOOL, "assignment")?;
     let asg = require_assignment(ledger, TOOL, &id)?;
     require_state(TOOL, "starting the gate", &asg, &["HandedBack"])?;
+    let timeout_ms = match args.get("timeoutMs") {
+        None | Some(Value::Null) => gate::DEFAULT_TIMEOUT_MS,
+        Some(Value::Number(n)) => n.as_u64().filter(|ms| *ms > 0).ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "{TOOL}: `timeoutMs` must be a positive integer of milliseconds"
+            ))
+        })?,
+        Some(_) => {
+            return Err(RpcError::invalid_params(format!(
+                "{TOOL}: `timeoutMs` must be a positive integer of milliseconds"
+            )))
+        }
+    };
     let gate = asg.gate.clone();
     let result = append_and_reload(
         ledger,
         TOOL,
         json!({"type": "gate_started", "assignment": id, "gate": gate}),
     )?;
-    // Execution is delivered by the detached Gate runner slice; this slice only
-    // records the HandedBack -> GateRunning transition.
+    // The Gate itself runs in a detached background process against the
+    // candidate; its completion (green | red | uncertain) lands in the ledger
+    // as `gate_completed`, observable via assignment_status / runtime_findings.
+    gate::spawn_detached(state_dir, project_root, &id, timeout_ms)
+        .map_err(|e| RpcError::internal(format!("{TOOL}: {e}")))?;
     Ok(json!({
-        "id": id,
+        "assignment": id,
         "state": result["state"],
         "gate": result["gate"],
-        "status": "pending",
-        "note": "gate execution is delivered by the detached Gate runner"
+        "timeoutMs": timeout_ms,
+        "status": "running",
     }))
+}
+
+/// Supervisor `runtime_findings`: the verified findings of the runtime replayed
+/// from the ledger — gate completion verdicts (with masked tail paths) and
+/// handbacks whose changed paths exceeded the declared Write Scope.
+fn runtime_findings(ledger: &Ledger) -> Result<Value, RpcError> {
+    let events = ledger.read_events();
+    let mut findings = Vec::new();
+    for event in &events {
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "gate_completed" => {
+                let mut finding = json!({
+                    "kind": "gate",
+                    "assignment": event.get("assignment").cloned().unwrap_or(Value::Null),
+                    "verdict": event.get("verdict").cloned().unwrap_or(Value::Null),
+                    "seq": event.get("seq").cloned().unwrap_or(Value::Null),
+                    "ts": event.get("ts").cloned().unwrap_or(Value::Null),
+                });
+                if let Some(tail) = event.get("tail") {
+                    finding["tail"] = tail.clone();
+                }
+                if let Some(reason) = event.get("reason") {
+                    finding["reason"] = reason.clone();
+                }
+                findings.push(finding);
+            }
+            "assignment_handed_back" => {
+                if let Some(paths) = event.get("scopeViolations").and_then(Value::as_array)
+                    && !paths.is_empty()
+                {
+                    findings.push(json!({
+                        "kind": "scope.exceeded",
+                        "assignment": event.get("assignment").cloned().unwrap_or(Value::Null),
+                        "paths": paths,
+                        "seq": event.get("seq").cloned().unwrap_or(Value::Null),
+                        "ts": event.get("ts").cloned().unwrap_or(Value::Null),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(json!({"findings": findings}))
 }
 
 // ---------------------------------------------------------------------------

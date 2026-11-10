@@ -18,12 +18,13 @@ use provisioner::{
     guard_removal_root, removal_paths, resolve_hotpot_home, runtime_opt_in_from_env,
     runtime_state_active,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use slp::{HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus};
 use std::env;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn parse_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
@@ -432,6 +433,131 @@ fn default_hotpot_home() -> String {
         .unwrap_or_else(|_| ".hotpot".to_string())
 }
 
+/// `hotpot export <project> --out <path>`: write a bundle of one Project's
+/// runtime state — assignment projections, the ledger event log (the runtime
+/// transcript of asks, handoffs, and gate completions), and the gate tails it
+/// references — with secret masking applied to the whole bundle before it is
+/// written (spec: "Secret Masking on Gate Tails & Exports").
+fn cmd_export(args: &[String]) {
+    let usage = "usage: hotpot export <project-path-or-slug> --out <path> [--state-dir <dir>]";
+    let Some(project) = args.first().map(String::as_str).filter(|s| !s.is_empty()) else {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    };
+    let Some(out) = parse_flag(args, "--out").filter(|s| !s.is_empty()) else {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    };
+    let state_dir = PathBuf::from(
+        parse_flag(args, "--state-dir")
+            .or_else(|| env::var("HOTPOT_HOME").ok())
+            .unwrap_or_else(default_hotpot_home),
+    );
+
+    // The project is either a repository path (canonicalized to its runtime
+    // slug) or the slug itself.
+    let slug = if Path::new(project).is_dir() {
+        runtime::project_slug(Path::new(project))
+    } else {
+        project.to_string()
+    };
+    let ledger = runtime::Ledger::at(
+        state_dir
+            .join("runtime")
+            .join("v1")
+            .join(&slug)
+            .join("ledger.jsonl"),
+    );
+    if !ledger.path().exists() {
+        eprintln!(
+            "hotpot export: no runtime ledger for project `{slug}` under {}; run the runtime coordinator first",
+            state_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let events = ledger.read_events();
+    let assignments: Vec<Value> = runtime::RuntimeState::from_events(&events)
+        .assignments()
+        .iter()
+        .map(|a| a.to_json())
+        .collect();
+    let assignments_len = assignments.len();
+    // Gate tails referenced by events travel with the bundle (already masked
+    // on write; masking the bundle again is a no-op for them).
+    let mut tails = serde_json::Map::new();
+    for event in &events {
+        if let Some(tail) = event.get("tail").and_then(Value::as_str)
+            && !tails.contains_key(tail)
+            && let Ok(content) = fs::read_to_string(tail)
+        {
+            tails.insert(tail.to_string(), Value::String(content));
+        }
+    }
+    let exported_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bundle = json!({
+        "project": slug,
+        "exportedAt": exported_at,
+        "assignments": assignments,
+        "events": events,
+        "gateTails": Value::Object(tails),
+    });
+    let masked = runtime::masking::mask_text(
+        &serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| "{}".to_string()),
+    );
+    if let Some(parent) = Path::new(&out).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(e) = fs::write(&out, masked) {
+        eprintln!("hotpot export: failed to write {}: {e}", out);
+        std::process::exit(1);
+    }
+    println!(
+        "export: {} ({} events, {} assignments; secrets masked)",
+        out,
+        events.len(),
+        assignments_len
+    );
+}
+
+/// `hotpot gate-runner`: internal entry point of the detached background Gate,
+/// spawned by the `gate_run` MCP tool. Runs one assignment's Gate against its
+/// candidate commit to completion and appends the `gate_completed` ledger
+/// event (green | red with a masked tail | uncertain).
+fn cmd_gate_runner(args: &[String]) {
+    let usage =
+        "usage: hotpot gate-runner --state-dir <dir> --project <root> --assignment <id> [--timeout-ms <n>]";
+    let Some(state_dir) = parse_flag(args, "--state-dir") else {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    };
+    let Some(project) = parse_flag(args, "--project") else {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    };
+    let Some(assignment) = parse_flag(args, "--assignment") else {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    };
+    let timeout_ms = parse_flag(args, "--timeout-ms")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(runtime::gate::DEFAULT_TIMEOUT_MS);
+    if let Err(e) = runtime::gate::run(
+        Path::new(&state_dir),
+        Path::new(&project),
+        &assignment,
+        timeout_ms,
+    ) {
+        eprintln!("hotpot gate-runner: {e}");
+        std::process::exit(1);
+    }
+}
+
 /// `hotpot auth login <codex|claude|pi> <supervisor|lead|peer>`: interactive vendor login
 /// scoped to exactly one Seat's Role Home (credentials land inside that seat only).
 fn cmd_auth(args: &[String]) {
@@ -490,10 +616,13 @@ fn main() {
             }
         }
         "auth" => cmd_auth(&args[2..]),
+        "export" => cmd_export(&args[2..]),
+        "gate-runner" => cmd_gate_runner(&args[2..]),
         "--help" | "-h" | "help" => {
             println!("hotpot 0.1.0 — Rust SLP verification engine & session inspector for Herdr");
             println!("Commands: status, inspect, hook, mcp, setup [--apply], verify, remove [--apply],");
-            println!("           auth login <codex|claude|pi> <supervisor|lead|peer>");
+            println!("           auth login <codex|claude|pi> <supervisor|lead|peer>,");
+            println!("           export <project> --out <path>");
         }
         _ => cmd_status(&args[1..]),
     }
