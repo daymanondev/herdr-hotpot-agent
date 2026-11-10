@@ -36,7 +36,7 @@ herdr-hotpot-agent/
 │   ├── sync.sh                 # Syncs `shared/*.js` into mod folders
 │   ├── check.sh                # Runs `cargo check`, `cargo test`, `sync.sh --check`, and `node --check` on all mods
 │   └── install.sh              # Builds `hotpot` release binary and installs layout/mods into `~/.config/herdr-app` (or `--root <dir>`)
-├── keys.json                   # Optional Herdr shortcuts for toggling the Hotpot panel and Session Inspector
+├── keys.json                   # Optional Herdr shortcuts for toggling the Hotpot panel and Session Inspector (`alt-t` = Raw PTY jump)
 ├── RECIPE.md                   # Herdr Gallery specification (`herdr.dev/gallery`)
 ├── AGENTS.md                   # Agent engineering rules and Matt Pocock skills pointers
 ├── GLOSSARY.md                 # Canonical domain vocabulary

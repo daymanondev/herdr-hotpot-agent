@@ -1,21 +1,38 @@
 import { View, div, TextView } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, hc, spaces, theme, run, shared, home } from "herdr";
+import { exec, hc, spaces, theme, run, shared, home, nextCommand, notify } from "herdr";
 import {
   HOTPOT_SELECTED_KEY,
   formatContextBadge,
   statusColor,
   parseHotpotJson,
+  transcriptKindMeta,
+  isNoticeKind,
+  isSeatActive,
+  defaultItemExpanded,
+  ptyTarget,
 } from "./protocol.js";
 
 export default class HotpotSessionInspector extends View {
   init(_props, cx) {
     this.items = [];
+    // Per-item collapse overrides for the selected seat: an absent key follows
+    // the default expansion (`defaultItemExpanded`); true/false pins the block.
     this.collapsed = {};
     this.lastAgentId = null;
     this.loading = false;
     this.promptInput = InputState.new(cx, { placeholder: "Send directive or message to this session..." });
     cx.timer.every(1500, (timerCx) => this.refresh(timerCx));
+    // Key handling for the `Alt+T` Raw PTY jump: `keys.json` binds
+    // `alt-t` to `hotpot-session:pty-focus`, delivered here.
+    cx.spawn(async (taskCx) => {
+      for (;;) {
+        const command = await nextCommand();
+        if (command === "pty-focus") {
+          this.focusPty(taskCx);
+        }
+      }
+    });
     this.refresh(cx);
   }
 
@@ -27,6 +44,12 @@ export default class HotpotSessionInspector extends View {
   refresh(cx) {
     const selected = shared(HOTPOT_SELECTED_KEY);
     if (!selected || this.loading) return;
+    // A new seat selection starts from a clean transcript and default expansion.
+    if (selected.id !== this.lastAgentId) {
+      this.lastAgentId = selected.id;
+      this.collapsed = {};
+      this.items = [];
+    }
     const sp = this.activeSpace();
     const folder = sp?.folder || home();
     this.loading = true;
@@ -65,33 +88,44 @@ export default class HotpotSessionInspector extends View {
     });
   }
 
+  // One-click `Raw PTY` / `Alt+T`: focus the selected seat's live `hc`
+  // terminal in the main stack. Without a terminal the jump is impossible;
+  // say so instead of silently switching to an empty pane.
+  focusPty(cx) {
+    const target = ptyTarget(shared(HOTPOT_SELECTED_KEY));
+    if (!target) {
+      notify({
+        title: "Raw PTY unavailable",
+        body: "This seat has no live hc terminal to jump to.",
+        level: "warning",
+      });
+      cx.notify();
+      return;
+    }
+    run("layout.select", { stack: "main-stack", child: "main" });
+    run("pane.focus", { terminal: target });
+  }
+
   sendPrompt(cx) {
     const selected = shared(HOTPOT_SELECTED_KEY);
+    const target = ptyTarget(selected);
     const text = (this.promptInput?.value?.() ?? "").trim();
-    if (!selected || !text) return;
+    if (!selected || !target || !text) return;
     this.promptInput?.set_value?.("", cx);
 
     cx.spawn(async (taskCx) => {
-      const sp = this.activeSpace();
-      const folder = sp?.folder || home();
-      if (selected.terminal) {
-        await hc(["send", selected.terminal, text]);
-      } else {
-        await exec(
-          "hotpot",
-          ["send", "--workspace", folder, "--role", selected.role || "lead", "--message", text],
-          { cwd: folder, on: sp?.machine ?? null },
-        );
-      }
+      await hc(["send", target, text]);
       this.refresh(taskCx);
     });
   }
 
-  renderTranscriptItem(t, item, idx) {
+  renderTranscriptItem(t, item, idx, seatActive) {
     const key = `item-${idx}`;
-    const isCollapsed = Boolean(this.collapsed[key]);
 
     if (item.kind === "thinking") {
+      const meta = transcriptKindMeta(item.kind);
+      const hasOverride = Object.prototype.hasOwnProperty.call(this.collapsed, key);
+      const isCollapsed = hasOverride ? this.collapsed[key] : !defaultItemExpanded(item, seatActive);
       return v_flex()
         .id(key)
         .p(10)
@@ -114,7 +148,7 @@ export default class HotpotSessionInspector extends View {
                 .items_center()
                 .gap(6)
                 .children([
-                  div().text_size(12).font_semibold().text_color(t.accent).child("💭 Thinking"),
+                  div().text_size(12).font_semibold().text_color(t.accent).child(`${meta.icon} ${meta.label}`),
                   div()
                     .text_size(11)
                     .text_color(t.dim)
@@ -122,6 +156,7 @@ export default class HotpotSessionInspector extends View {
                 ]),
               div().text_size(11).text_color(t.muted).child(isCollapsed ? "▶ Expand" : "▼ Collapse"),
             ]),
+          // The full reasoning body: long thinking is never truncated.
           ...(!isCollapsed
             ? [
                 TextView.markdown(`${key}-md`, item.body || "")
@@ -133,6 +168,7 @@ export default class HotpotSessionInspector extends View {
     }
 
     if (item.kind === "tool_call") {
+      const meta = transcriptKindMeta(item.kind);
       return v_flex()
         .id(key)
         .p(10)
@@ -150,20 +186,21 @@ export default class HotpotSessionInspector extends View {
                 .text_size(12)
                 .font_semibold()
                 .text_color(t.foreground)
-                .child(`🔧 ${item.title || "Tool Call"}`),
+                .child(`${meta.icon} ${item.title || meta.label}`),
               div()
                 .px(6)
                 .rounded(4)
                 .bg(t.canvas)
                 .text_size(10)
                 .text_color(statusColor(t, item.status || "done"))
-                .child((item.status || "OK").toUpperCase()),
+                .child((item.status || "done").toUpperCase()),
             ]),
           div().text_size(11).text_color(t.muted).child(item.body || ""),
         ]);
     }
 
-    if (item.kind === "mailbox") {
+    if (isNoticeKind(item.kind)) {
+      const meta = transcriptKindMeta(item.kind);
       return v_flex()
         .id(key)
         .p(10)
@@ -177,7 +214,7 @@ export default class HotpotSessionInspector extends View {
             .text_size(11)
             .font_semibold()
             .text_color(t.accent)
-            .child(`📩 ${item.title || "Mailbox"}`),
+            .child(`${meta.icon} ${item.title || meta.label}`),
           TextView.markdown(`${key}-md`, item.body || "").text_size(12).text_color(t.foreground),
         ]);
     }
@@ -211,6 +248,8 @@ export default class HotpotSessionInspector extends View {
       status: "idle",
       context_tokens: 42100,
     };
+    const seatActive = isSeatActive(selected);
+    const target = ptyTarget(selected);
 
     return v_flex()
       .id("root")
@@ -252,11 +291,8 @@ export default class HotpotSessionInspector extends View {
                   .text_color(t.accent)
                   .child(formatContextBadge(selected.context_tokens ?? 0, selected.role)),
               ]),
-            h_flex()
-              .items_center()
-              .gap(6)
-              .children([
-                div()
+            target
+              ? div()
                   .id("btn-switch-pty")
                   .px(8)
                   .p(4)
@@ -265,14 +301,17 @@ export default class HotpotSessionInspector extends View {
                   .text_size(11)
                   .text_color(t.foreground)
                   .hover((s) => s.bg(t.hover))
-                  .child("⌨ Open Raw Terminal (PTY)")
-                  .on_click(() => {
-                    run("layout.select", { stack: "main-stack", child: "main" });
-                    if (selected.terminal) {
-                      run("pane.focus", { terminal: selected.terminal });
-                    }
-                  }),
-              ]),
+                  .child("⌨ Raw PTY · Alt+T")
+                  .on_click(() => this.focusPty(cx))
+              : div()
+                  .id("btn-switch-pty-disabled")
+                  .px(8)
+                  .p(4)
+                  .rounded(6)
+                  .bg(t.canvas)
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .child("⌨ Raw PTY · Alt+T — no live hc terminal"),
           ]),
 
         v_flex()
@@ -282,7 +321,7 @@ export default class HotpotSessionInspector extends View {
           .overflow_y_scrollbar()
           .children(
             this.items.length > 0
-              ? this.items.map((item, idx) => this.renderTranscriptItem(t, item, idx))
+              ? this.items.map((item, idx) => this.renderTranscriptItem(t, item, idx, seatActive))
               : [
                   v_flex()
                     .p(12)
@@ -301,7 +340,7 @@ export default class HotpotSessionInspector extends View {
                         .text_size(12)
                         .text_color(t.muted)
                         .child(
-                          "Select Supervisor, Lead, or any active Peer on the right-hand Hotpot panel to stream its full Thinking blocks, Tool Calls, and Mailbox history in real time.",
+                          "Select Supervisor, Lead, or any active Peer on the right-hand Hotpot panel to stream its full Thinking blocks, Tool Calls, and Attention / Assignment Notices in real time.",
                         ),
                     ]),
                 ],
@@ -317,17 +356,28 @@ export default class HotpotSessionInspector extends View {
           .border_color(t.input)
           .children([
             div().flex_1().child(Input.new(this.promptInput)),
-            div()
-              .id("btn-send-prompt")
-              .px(10)
-              .p(6)
-              .rounded(6)
-              .bg(t.solid)
-              .text_size(12)
-              .font_semibold()
-              .text_color(t.solid_foreground)
-              .child("Send ↵")
-              .on_click(() => this.sendPrompt(cx)),
+            target
+              ? div()
+                  .id("btn-send-prompt")
+                  .px(10)
+                  .p(6)
+                  .rounded(6)
+                  .bg(t.solid)
+                  .text_size(12)
+                  .font_semibold()
+                  .text_color(t.solid_foreground)
+                  .hover((s) => s.bg(t.hover))
+                  .child("Send ↵")
+                  .on_click(() => this.sendPrompt(cx))
+              : div()
+                  .id("btn-send-prompt-disabled")
+                  .px(10)
+                  .p(6)
+                  .rounded(6)
+                  .bg(t.canvas)
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .child("Send — no live hc terminal"),
           ]),
       ]);
   }

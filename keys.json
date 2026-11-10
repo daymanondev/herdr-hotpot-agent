@@ -19,6 +19,7 @@
         "stack": "main-stack",
         "child": "main"
       }
-    }
+    },
+    "alt-t": "hotpot-session:pty-focus"
   }
 }
