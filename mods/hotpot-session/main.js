@@ -1,5 +1,5 @@
-import { View, div, TextView } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { View, div } from "gpui-kit";
+import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
 import { exec, hc, spaces, theme, run, shared, home, nextCommand, notify, watchFolder } from "herdr";
 import {
   HOTPOT_SELECTED_KEY,

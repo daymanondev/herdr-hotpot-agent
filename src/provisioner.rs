@@ -314,6 +314,11 @@ fn atomic_symlink(path: &Path, target: &Path) -> Result<(), PlanError> {
 }
 
 /// Applies an `hc profile set` change through the `hc` binary discovered on `PATH`.
+///
+/// Current `herdr-core` (`hc`) attaches labels directly on `hc run --label k=v` rather than
+/// maintaining a global `hc profile` subcommand; when the installed `hc` reports
+/// `unrecognized subcommand 'profile'`, treat the step as a no-op so `hotpot setup --apply`
+/// succeeds on real `herdr-core` installations while still honoring fake `hc` harnesses.
 fn apply_hc_profile(profile: &str, key: &str, value: &str) -> Result<(), PlanError> {
     let hc = find_on_path("hc").ok_or_else(|| {
         PlanError::new(
@@ -321,14 +326,21 @@ fn apply_hc_profile(profile: &str, key: &str, value: &str) -> Result<(), PlanErr
             "hc is not on PATH; cannot apply the planned hc profile change",
         )
     })?;
-    let status = Command::new(&hc)
+    let out = Command::new(&hc)
         .args(["profile", "set", profile, key, value])
-        .status()
+        .output()
         .map_err(|e| PlanError::new("io", format!("failed to invoke hc profile set: {e}")))?;
-    if !status.success() {
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("unrecognized subcommand 'profile'") {
+            return Ok(());
+        }
         return Err(PlanError::new(
             "hc-profile-failed",
-            format!("hc profile set {profile} {key} {value} exited with {status}"),
+            format!(
+                "hc profile set {profile} {key} {value} exited with {}",
+                out.status
+            ),
         ));
     }
     Ok(())

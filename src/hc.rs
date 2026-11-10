@@ -85,7 +85,9 @@ pub fn list_terminals_strict() -> Result<Vec<HcTerminalSummary>, PlanError> {
 
 /// Creates a persistent terminal via `hc run` with caller-assembled arguments (labels, env,
 /// cwd, and the vendor command after `--`); the `hc run` flag vocabulary rides in `args` so
-/// this stays a thin process bridge.
+/// this stays a thin process bridge. When the installed `herdr-core` (`hc`) rejects `--env`
+/// on `hc run`, falls back to passing the environment pairs via `env K=V ...` after `--` and
+/// translating `--disallow-tool` to `--disallowedTools` for real `claude` CLI compatibility.
 pub fn run_terminal(args: &[String]) -> Result<(), PlanError> {
     let hc = hc_binary().ok_or_else(|| {
         PlanError::new(
@@ -93,19 +95,67 @@ pub fn run_terminal(args: &[String]) -> Result<(), PlanError> {
             "hc is not available (neither HOTPOT_HC nor PATH names it); cannot create a terminal",
         )
     })?;
-    let status = Command::new(&hc)
+    let out = Command::new(&hc)
         .arg("run")
         .args(args)
-        .status()
+        .output()
         .map_err(|e| PlanError::new("io", format!("failed to invoke hc run: {e}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(PlanError::new(
-            "hc-run-failed",
-            format!("hc run exited with {status}"),
-        ))
+    if out.status.success() {
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("unexpected argument '--env'") {
+        let fallback = rewrite_for_herdr_core(args);
+        let retry = Command::new(&hc)
+            .arg("run")
+            .args(&fallback)
+            .status()
+            .map_err(|e| PlanError::new("io", format!("failed to invoke hc run: {e}")))?;
+        if retry.success() {
+            return Ok(());
+        }
+        return Err(PlanError::new(
+            "hc-run-failed",
+            format!("hc run exited with {retry}"),
+        ));
+    }
+    Err(PlanError::new(
+        "hc-run-failed",
+        format!("hc run exited with {}", out.status),
+    ))
+}
+
+/// Rewrites `hc run` argv carrying `--env K=V ... -- <vendor> ...` into
+/// `hc run ... -- env K=V ... <vendor> ...` for `herdr-core` binaries whose `hc run` does not
+/// take `--env` directly, and maps `--disallow-tool` to `--disallowedTools` for Claude Code.
+fn rewrite_for_herdr_core(args: &[String]) -> Vec<String> {
+    let sep = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let (before, after) = (&args[..sep], &args[sep..]);
+    let mut hc_flags = Vec::new();
+    let mut env_pairs = Vec::new();
+    let mut i = 0;
+    while i < before.len() {
+        if before[i] == "--env" && i + 1 < before.len() {
+            env_pairs.push(before[i + 1].clone());
+            i += 2;
+        } else {
+            hc_flags.push(before[i].clone());
+            i += 1;
+        }
+    }
+    hc_flags.push("--".to_string());
+    if !env_pairs.is_empty() {
+        hc_flags.push("env".to_string());
+        hc_flags.extend(env_pairs);
+    }
+    for arg in after.iter().skip(1) {
+        if arg == "--disallow-tool" {
+            hc_flags.push("--disallowedTools".to_string());
+        } else {
+            hc_flags.push(arg.clone());
+        }
+    }
+    hc_flags
 }
 
 /// Sends prompt text to a live `hc` terminal (`hc send <target> <message>`).

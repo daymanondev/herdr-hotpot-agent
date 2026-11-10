@@ -475,10 +475,14 @@ fn check_pi_launch_args(home: &Path, role: &str, mode: CheckMode) -> Vec<CheckRe
     }
 }
 
-/// `pi-mcp-probe`: launches the `pi` binary found on `PATH` with exactly the closed launch
-/// args plus `rpc /mcp` (an offline RPC probe — never the network) and asserts `/mcp`
-/// resolves strictly to `builtin:mcp`.
+/// `pi-mcp-probe`: launches the `pi` binary found on `PATH` with the closed launch args in
+/// offline RPC mode (`--offline --mode rpc`, feeding `{"type":"get_commands"}` on stdin and
+/// closing stdin immediately so neither real `pi` nor a fake test shim can block) and asserts
+/// `/mcp` resolves strictly to `builtin:mcp`.
 fn check_pi_mcp_probe(role: &str) -> CheckResult {
+    use std::io::Write;
+    use std::process::Stdio;
+
     let seat = format!("roles/pi/{role}");
     let Some(pi) = find_on_path("pi") else {
         return CheckResult::fail(
@@ -486,11 +490,26 @@ fn check_pi_mcp_probe(role: &str) -> CheckResult {
             format!("pi is not on PATH; cannot probe /mcp resolution for {seat}"),
         );
     };
-    let output = Command::new(&pi)
+    let mut child = match Command::new(&pi)
         .args(PI_LAUNCH_ARGS)
-        .args(["rpc", "/mcp"])
-        .output();
-    let Ok(output) = output else {
+        .args(["--offline", "--mode", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            return CheckResult::fail(
+                CHECK_PI_PROBE,
+                format!("failed to run the pi RPC probe for {seat}"),
+            );
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"{\"type\":\"get_commands\"}\n");
+    }
+    let Ok(output) = child.wait_with_output() else {
         return CheckResult::fail(
             CHECK_PI_PROBE,
             format!("failed to run the pi RPC probe for {seat}"),
@@ -504,18 +523,33 @@ fn check_pi_mcp_probe(role: &str) -> CheckResult {
                 output.status.code().unwrap_or(-1)
             ),
         );
-    }
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let report: Value = match serde_json::from_str(stdout.trim()) {
+    let first_line = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default();
+    let report: Value = match serde_json::from_str(first_line.trim()) {
         Ok(value) => value,
         Err(_) => {
             return CheckResult::fail(
                 CHECK_PI_PROBE,
-                format!("pi RPC probe for {seat} returned unparseable output: {}", stdout.trim()),
-            )
+                format!(
+                    "pi RPC probe for {seat} returned unparseable output: {}",
+                    stdout.trim()
+                ),
+            );
         }
     };
-    let extensions = string_array(&report, "extensions").unwrap_or_default();
+    let extensions = string_array(&report, "extensions").unwrap_or_else(|| {
+        report["data"]["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|cmd| cmd["name"].as_str() == Some("mcp"))
+            .filter_map(|cmd| cmd["sourceInfo"]["path"].as_str().map(str::to_string))
+            .collect()
+    });
     let expected: Vec<String> = vec!["builtin:mcp".to_string()];
     if extensions == expected {
         CheckResult::ok(
