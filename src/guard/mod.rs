@@ -32,11 +32,32 @@ impl Role {
     }
 }
 
-/// Core design skills permitted to the `Lead` seat (Peer-Owned Domain Skills Law).
-pub const LEAD_ALLOWED_SKILLS: &[&str] = &["codebase-design", "domain-modeling", "tdd"];
-
 /// Owner-only bootstrap skills that neither `Lead` nor `Peer` may invoke or read.
 pub const OWNER_ONLY_SKILLS: &[&str] = &["factory", "hotpot"];
+
+/// Runtime skill allowlists derived from the projection manifest that `hotpot setup` writes
+/// under Hotpot Home (`skill-projections/manifest.json`) — the single source of truth for
+/// which skills a `Lead` or `Peer` seat may load. When no manifest is present the fence
+/// fails closed: no manifest, no granted skills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillFence {
+    /// Skills projected into the Lead aggregates.
+    pub lead_allowed: Vec<String>,
+    /// Skills projected into the Peer Role Homes.
+    pub peer_allowed: Vec<String>,
+}
+
+impl SkillFence {
+    /// Loads the fence from `<state_dir>/skill-projections/manifest.json` (`None` when the
+    /// manifest is absent or unparseable — callers fail closed on `None`).
+    pub fn load(state_dir: &Path) -> Option<Self> {
+        let manifest = crate::skills::load_projection_manifest(state_dir)?;
+        Some(Self {
+            lead_allowed: manifest.lead_skills,
+            peer_allowed: manifest.peer_skills,
+        })
+    }
+}
 
 /// Memory files a `Supervisor` or `Lead` seat is permitted to edit at `<project-root>`.
 pub const SEAT_MEMORY_WHITELIST: &[&str] = &[
@@ -86,9 +107,15 @@ pub fn extract_skill_name_from_path(path: &str) -> Option<String> {
 }
 
 /// Checks whether `role` is allowed to load or read `skill_name`.
+///
+/// `Lead` and `Peer` allowlists derive from `fence` — the projection manifest written by
+/// `hotpot setup` under Hotpot Home (never a hardcoded list). Both roles fail closed when
+/// the manifest is absent. A `Peer` Task Contract may narrow the projected set further via
+/// `contract_skills`, but never widen it.
 pub fn check_skill_access(
     role: Role,
     skill_name: &str,
+    fence: Option<&SkillFence>,
     contract_skills: Option<&[String]>,
 ) -> ChokeVerdict {
     let skill = skill_name.trim();
@@ -104,20 +131,44 @@ pub fn check_skill_access(
 
     match role {
         Role::Supervisor => ChokeVerdict::allow(),
-        Role::Lead => {
-            if LEAD_ALLOWED_SKILLS.contains(&skill) {
-                ChokeVerdict::allow()
-            } else {
-                ChokeVerdict::deny(
-                    "lead-skill-fence",
-                    format!(
-                        "Role `lead` may only load core design skills ({}); implementation skill `{skill}` is Peer-owned",
-                        LEAD_ALLOWED_SKILLS.join(", ")
+        Role::Lead => match fence
+            .filter(|f| f.lead_allowed.iter().any(|s| s == skill))
+        {
+            Some(_) => ChokeVerdict::allow(),
+            None => {
+                let reason = match fence {
+                    Some(f) => format!(
+                        "Role `lead` may only load skills projected into its Lead aggregate ({}); skill `{skill}` was projected out",
+                        f.lead_allowed.join(", ")
                     ),
-                )
+                    None => format!(
+                        "no skill projection manifest found under the state dir; run `hotpot setup --apply` before loading skills (denied `{skill}`)"
+                    ),
+                };
+                ChokeVerdict::deny("lead-skill-fence", reason)
             }
-        }
+        },
         Role::Agent => {
+            match fence {
+                Some(f) if f.peer_allowed.iter().any(|s| s == skill) => {}
+                Some(f) => {
+                    return ChokeVerdict::deny(
+                        "peer-skill-fence",
+                        format!(
+                            "Skill `{skill}` is not projected into any Peer Role Home (projected: {})",
+                            f.peer_allowed.join(", ")
+                        ),
+                    );
+                }
+                None => {
+                    return ChokeVerdict::deny(
+                        "peer-skill-fence",
+                        format!(
+                            "no skill projection manifest found under the state dir; run `hotpot setup --apply` before loading skills (denied `{skill}`)"
+                        ),
+                    );
+                }
+            }
             if let Some(allowed) = contract_skills
                 && !allowed.is_empty()
                 && !allowed.iter().any(|s| s == skill)
@@ -202,6 +253,7 @@ pub fn evaluate_write_path(
 pub fn evaluate_bash_command(
     role: Role,
     command: &str,
+    fence: Option<&SkillFence>,
     contract_skills: Option<&[String]>,
 ) -> ChokeVerdict {
     let trimmed = command.trim();
@@ -225,7 +277,7 @@ pub fn evaluate_bash_command(
     for word in trimmed.split_whitespace() {
         let clean = word.trim_matches(|c| c == '"' || c == '\'');
         if let Some(skill) = extract_skill_name_from_path(clean) {
-            let verdict = check_skill_access(role, &skill, contract_skills);
+            let verdict = check_skill_access(role, &skill, fence, contract_skills);
             if !verdict.allowed {
                 return verdict;
             }
@@ -247,6 +299,10 @@ pub fn evaluate_bash_command(
 }
 
 /// Evaluates a `PreToolUse` JSON payload from Claude Code / Codex / Antigravity / OpenCode.
+///
+/// The skill fence is loaded once per call from the projection manifest under `state_dir`
+/// (a single small-file read + JSON parse, well inside the `< 1.5ms` choke budget); without
+/// a manifest the Lead/Peer skill verdicts fail closed.
 pub fn evaluate_pre_tool_hook(
     role: Role,
     payload: &Value,
@@ -254,6 +310,11 @@ pub fn evaluate_pre_tool_hook(
     state_dir: &str,
     contract_skills: Option<&[String]>,
 ) -> Value {
+    let fence = if state_dir.is_empty() {
+        None
+    } else {
+        SkillFence::load(Path::new(state_dir))
+    };
     let tool_name = payload
         .get("tool_name")
         .or_else(|| payload.get("tool"))
@@ -271,7 +332,7 @@ pub fn evaluate_pre_tool_hook(
                 .or_else(|| tool_input.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            check_skill_access(role, skill, contract_skills)
+            check_skill_access(role, skill, fence.as_ref(), contract_skills)
         }
         "Read" | "read" | "read_file" => {
             let path = tool_input
@@ -280,7 +341,7 @@ pub fn evaluate_pre_tool_hook(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if let Some(skill) = extract_skill_name_from_path(path) {
-                check_skill_access(role, &skill, contract_skills)
+                check_skill_access(role, &skill, fence.as_ref(), contract_skills)
             } else {
                 ChokeVerdict::allow()
             }
@@ -299,7 +360,7 @@ pub fn evaluate_pre_tool_hook(
                 .or_else(|| tool_input.get("CommandLine"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            evaluate_bash_command(role, cmd, contract_skills)
+            evaluate_bash_command(role, cmd, fence.as_ref(), contract_skills)
         }
         _ => ChokeVerdict::allow(),
     };
@@ -400,36 +461,106 @@ pub fn materialize_clean_room_home(
 mod tests {
     use super::*;
 
-    #[test]
-    fn lead_is_blocked_from_loading_implementation_skills() {
-        let ok = check_skill_access(Role::Lead, "codebase-design", None);
-        assert!(ok.allowed);
+    /// A fixture fence mirroring a projection manifest over operator skills `tdd`,
+    /// `codebase-design`, and the built-in `hotpot-project-onboarding`.
+    fn fixture_fence() -> SkillFence {
+        SkillFence {
+            lead_allowed: vec![
+                "codebase-design".to_string(),
+                "hotpot-project-onboarding".to_string(),
+                "tdd".to_string(),
+            ],
+            peer_allowed: vec!["codebase-design".to_string(), "tdd".to_string()],
+        }
+    }
 
-        let blocked = check_skill_access(Role::Lead, "expo-router", None);
-        assert!(!blocked.allowed);
-        assert_eq!(blocked.code, "lead-skill-fence");
+    /// A temp state dir carrying the fixture fence as a real projection manifest (the same
+    /// artifact `hotpot setup --apply` writes and `hotpot hook` loads).
+    fn state_dir_with_manifest() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hotpot-guard-fence-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join("skill-projections")).unwrap();
+        let fence = fixture_fence();
+        let manifest = json!({
+            "version": 1,
+            "lead_skills": fence.lead_allowed,
+            "peer_skills": fence.peer_allowed,
+            "collisions": [],
+        });
+        fs::write(
+            dir.join("skill-projections").join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        dir
     }
 
     #[test]
-    fn peer_is_blocked_from_owner_factory_skill_and_ungranted_skills() {
-        let factory_blocked = check_skill_access(Role::Agent, "factory", None);
+    fn lead_skill_access_follows_the_projection_manifest_and_fails_closed_without_it() {
+        let fence = fixture_fence();
+        let ok = check_skill_access(Role::Lead, "codebase-design", Some(&fence), None);
+        assert!(ok.allowed);
+
+        let blocked = check_skill_access(Role::Lead, "expo-router", Some(&fence), None);
+        assert!(!blocked.allowed);
+        assert_eq!(blocked.code, "lead-skill-fence");
+        assert!(
+            blocked.reason.contains("projected out"),
+            "the denial must say the skill was projected out: {}",
+            blocked.reason
+        );
+
+        // No manifest: the fence fails closed (no hardcoded allowlist remains).
+        let no_manifest = check_skill_access(Role::Lead, "codebase-design", None, None);
+        assert!(!no_manifest.allowed);
+        assert_eq!(no_manifest.code, "lead-skill-fence");
+    }
+
+    #[test]
+    fn peer_skill_access_follows_the_projection_manifest_and_contract_narrows_it() {
+        let fence = fixture_fence();
+
+        let projected = check_skill_access(Role::Agent, "tdd", Some(&fence), None);
+        assert!(projected.allowed);
+
+        let projected_out = check_skill_access(Role::Agent, "expo-router", Some(&fence), None);
+        assert!(!projected_out.allowed);
+        assert_eq!(projected_out.code, "peer-skill-fence");
+
+        let factory_blocked = check_skill_access(Role::Agent, "factory", Some(&fence), None);
         assert!(!factory_blocked.allowed);
         assert_eq!(factory_blocked.code, "skill-fence");
 
-        let granted = vec!["tdd".to_string(), "expo-ui".to_string()];
-        assert!(check_skill_access(Role::Agent, "expo-ui", Some(&granted)).allowed);
-        assert!(!check_skill_access(Role::Agent, "firebase-auth", Some(&granted)).allowed);
+        // A Task Contract may narrow the projected set, never widen it.
+        let granted = vec!["tdd".to_string()];
+        assert!(check_skill_access(Role::Agent, "tdd", Some(&fence), Some(&granted)).allowed);
+        let narrowed = check_skill_access(Role::Agent, "codebase-design", Some(&fence), Some(&granted));
+        assert!(!narrowed.allowed);
+        assert_eq!(narrowed.code, "peer-contract-skill-fence");
     }
 
     #[test]
-    fn pre_tool_hook_blocks_lead_reading_implementation_skill_via_read_or_bash() {
+    fn pre_tool_hook_blocks_lead_reading_projected_out_skill_via_read_or_bash() {
+        let state_dir = state_dir_with_manifest();
+
         let read_payload = json!({
             "tool_name": "Read",
             "tool_input": {
-                "file_path": "/Users/dev/.agents/skills/expo-router/SKILL.md"
+                "file_path": "/home/dev/.agents/skills/expo-router/SKILL.md"
             }
         });
-        let out = evaluate_pre_tool_hook(Role::Lead, &read_payload, "/repo", "/state", None);
+        let out = evaluate_pre_tool_hook(
+            Role::Lead,
+            &read_payload,
+            "/repo",
+            &state_dir.display().to_string(),
+            None,
+        );
         assert_eq!(
             out["hookSpecificOutput"]["permissionDecision"],
             Value::String("deny".to_string())
@@ -441,11 +572,36 @@ mod tests {
                 "command": "cat ~/.agents/skills/expo-router/SKILL.md"
             }
         });
-        let bash_out = evaluate_pre_tool_hook(Role::Lead, &bash_payload, "/repo", "/state", None);
+        let bash_out = evaluate_pre_tool_hook(
+            Role::Lead,
+            &bash_payload,
+            "/repo",
+            &state_dir.display().to_string(),
+            None,
+        );
         assert_eq!(
             bash_out["hookSpecificOutput"]["permissionDecision"],
             Value::String("deny".to_string())
         );
+
+        // A projected-in skill loads through the same manifest-backed fence.
+        let ok_payload = json!({
+            "tool_name": "Skill",
+            "tool_input": { "skill": "codebase-design" }
+        });
+        let ok_out = evaluate_pre_tool_hook(
+            Role::Lead,
+            &ok_payload,
+            "/repo",
+            &state_dir.display().to_string(),
+            None,
+        );
+        assert_eq!(
+            ok_out["hookSpecificOutput"]["permissionDecision"],
+            Value::String("allow".to_string())
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
@@ -470,7 +626,8 @@ mod tests {
 
     #[test]
     fn direct_hc_and_herdr_cli_calls_are_fenced() {
-        let v = evaluate_bash_command(Role::Lead, "hc run --bg claude", None);
+        let fence = fixture_fence();
+        let v = evaluate_bash_command(Role::Lead, "hc run --bg claude", Some(&fence), None);
         assert!(!v.allowed);
         assert_eq!(v.code, "seat-hc-tool-fence");
     }

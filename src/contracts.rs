@@ -71,8 +71,9 @@ const SUPERVISOR_BODY: &str = "\
 const LEAD_BODY: &str = "\
 ## role-lead
 
-- You are the durable technical owner of one Project: read the repository's
-  `WORKSPACE_PROTOCOL.md` when present and fall back to your operating baseline when absent.
+- You are the durable technical owner of one Project: read the repository's root
+  `WORKSPACE_PROTOCOL.md` when present and fall back to your built-in operating baseline
+  when absent.
 - Decompose work into bounded Assignments (outcome, Disposition, Write Scope, Gate, thinking
   effort) and dispatch them to Peers without pre-solving the implementation.
 - Verify, don't trust: run Gates against Candidate commits, validate handoffs against live
@@ -80,6 +81,9 @@ const LEAD_BODY: &str = "\
 - Own Writer Leases: one writer in the checkout, or up to three disjoint worktree writers;
   never let concurrent edits dirty the working tree.";
 
+/// The Peer body carries the WORKSPACE_PROTOCOL visibility rule by omission: no Peer
+/// artifact may reference or contain the boundary document (`GLOSSARY.md` WORKSPACE_PROTOCOL),
+/// so the body states the attention boundary without naming it.
 const PEER_BODY: &str = "\
 ## role-peer
 
@@ -89,8 +93,8 @@ const PEER_BODY: &str = "\
   never spawn or direct other agents.
 - Before handing back writable work: run the Assignment's Gate, commit in a clean tree, and
   stay inside your declared Write Scope.
-- Repository-wide workflow policy is the Lead's concern; you are never told
-  `WORKSPACE_PROTOCOL.md` exists.";
+- Repository-wide workflow policy is the Lead's concern alone; give 100% of your attention
+  to your Assignment brief.";
 
 /// The built-in role body for `role` (`None` when `role` is not a contract role).
 pub fn builtin_role_body(role: &str) -> Option<&'static str> {

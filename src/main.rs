@@ -6,6 +6,7 @@ pub mod inspector;
 pub mod provisioner;
 pub mod role_homes;
 pub mod runtime;
+pub mod skills;
 pub mod slp;
 
 use contracts::RenderedContracts;
@@ -21,7 +22,7 @@ use slp::{HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus};
 use std::env;
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn parse_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
@@ -275,7 +276,8 @@ fn cmd_mcp(args: &[String]) {
 
 /// `hotpot setup [--apply]`: dry-run desired-state planning over Hotpot Home by default;
 /// `--apply` materializes exactly the planned set (nine Role Homes with their vendor configs,
-/// additive role contracts, `AUTHENTICATION.md`, and the `hotpot.json` marker).
+/// additive role contracts, skill projections with the built-in `hotpot-project-onboarding`
+/// skill, `AUTHENTICATION.md`, and the `hotpot.json` marker).
 fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
     let apply = args.iter().any(|a| a == "--apply");
     let home = resolve_hotpot_home()?;
@@ -285,12 +287,16 @@ fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
         PlanError::new("io", format!("failed to resolve the running hotpot binary: {e}"))
     })?;
     let hc_available = find_on_path("hc").is_some();
+    // The operator's HOME is a read-only input: its per-vendor skill roots feed the
+    // projections; nothing under it is ever written.
+    let operator_home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let plan = base_home_plan(
         &home,
         &hotpot_bin,
         &contracts,
         runtime_opt_in,
         hc_available,
+        &operator_home,
     );
     plan.validate()?;
 
