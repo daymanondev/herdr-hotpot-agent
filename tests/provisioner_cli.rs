@@ -138,6 +138,17 @@ fn write_fake_hc(bin_dir: &Path, log: &Path) {
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Writes a fake `hc` shim whose every invocation fails: it prints `stderr_line` to stderr
+/// and exits `status` — the shape a real `herdr-core` reports for an unknown subcommand
+/// (`error: unrecognized subcommand 'profile'`, clap-style) or a genuine `hc` failure.
+fn write_failing_hc(bin_dir: &Path, stderr_line: &str, status: i32) {
+    fs::create_dir_all(bin_dir).unwrap();
+    let script = format!("#!/bin/sh\necho {stderr_line:?} >&2\nexit {status}\n");
+    let shim = bin_dir.join("hc");
+    fs::write(&shim, script).unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn run_hotpot(
     home: &Path,
     fake_home: &Path,
@@ -387,6 +398,43 @@ fn setup_apply_invokes_hc_with_the_planned_profile_change() {
         "apply must invoke hc with exactly the planned profile change"
     );
     assert!(home.path().join("hotpot.json").exists());
+}
+
+/// A real `herdr-core` (`hc`) lacking the `profile` subcommand must not fail `setup
+/// --apply`, but the dropped change may never be silent either: the report prints a skip
+/// note instead of an `applied:` line, and the rest of the plan still materializes.
+#[test]
+fn setup_apply_notes_the_skipped_profile_change_when_hc_lacks_the_subcommand() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let bin = TempDir::new("bin");
+    write_failing_hc(bin.path(), "error: unrecognized subcommand 'profile'", 2);
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        Some(bin.path()),
+        &["setup", "--apply"],
+    );
+    assert!(
+        out.status.success(),
+        "an hc without the profile subcommand must not fail setup --apply\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("skipped hc profile set hotpot hotpot.v1 true"),
+        "the dropped hc profile change must be reported as a skip note:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("applied: hc profile set"),
+        "a skipped change must not claim it was applied:\n{stdout}"
+    );
+    assert!(
+        home.path().join("hotpot.json").exists(),
+        "the rest of the plan still applies around the skipped hc step"
+    );
 }
 
 #[test]

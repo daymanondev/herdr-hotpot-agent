@@ -207,8 +207,19 @@ impl Plan {
                     key,
                     value,
                 } => {
-                    apply_hc_profile(profile, key, value)?;
-                    writeln!(out, "applied: hc profile set {profile} {key} {value}")
+                    let line = match apply_hc_profile(profile, key, value)? {
+                        HcProfileOutcome::Applied => {
+                            format!("applied: hc profile set {profile} {key} {value}")
+                        }
+                        // Never a silent no-op: the installed `hc` cannot take the planned
+                        // change, and the apply report must say so.
+                        HcProfileOutcome::Skipped => format!(
+                            "note: skipped hc profile set {profile} {key} {value}: the installed \
+                             hc has no 'profile' subcommand (herdr-core attaches labels per \
+                             'hc run' instead)"
+                        ),
+                    };
+                    writeln!(out, "{line}")
                         .map_err(|e| PlanError::new("io", format!("failed to print plan progress: {e}")))?;
                 }
             }
@@ -373,13 +384,25 @@ fn atomic_symlink(path: &Path, target: &Path) -> Result<(), PlanError> {
     Ok(())
 }
 
+/// The outcome of applying one planned `hc profile set` change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HcProfileOutcome {
+    /// The installed `hc` accepted and applied the change.
+    Applied,
+    /// The installed `hc` has no `profile` subcommand, so the step is a no-op — never a
+    /// silent one: `Plan::apply` prints a note so `setup --apply` never reports success
+    /// over a dropped change without saying so.
+    Skipped,
+}
+
 /// Applies an `hc profile set` change through the `hc` binary discovered on `PATH`.
 ///
 /// Current `herdr-core` (`hc`) attaches labels directly on `hc run --label k=v` rather than
 /// maintaining a global `hc profile` subcommand; when the installed `hc` reports
-/// `unrecognized subcommand 'profile'`, treat the step as a no-op so `hotpot setup --apply`
-/// succeeds on real `herdr-core` installations while still honoring fake `hc` harnesses.
-fn apply_hc_profile(profile: &str, key: &str, value: &str) -> Result<(), PlanError> {
+/// `unrecognized subcommand 'profile'`, the step resolves to [`HcProfileOutcome::Skipped`]
+/// so `hotpot setup --apply` still succeeds on real `herdr-core` installations while fake
+/// `hc` harnesses keep being honored.
+fn apply_hc_profile(profile: &str, key: &str, value: &str) -> Result<HcProfileOutcome, PlanError> {
     let hc = find_on_path("hc").ok_or_else(|| {
         PlanError::new(
             "hc-not-found",
@@ -390,20 +413,20 @@ fn apply_hc_profile(profile: &str, key: &str, value: &str) -> Result<(), PlanErr
         .args(["profile", "set", profile, key, value])
         .output()
         .map_err(|e| PlanError::new("io", format!("failed to invoke hc profile set: {e}")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("unrecognized subcommand 'profile'") {
-            return Ok(());
-        }
-        return Err(PlanError::new(
-            "hc-profile-failed",
-            format!(
-                "hc profile set {profile} {key} {value} exited with {}",
-                out.status
-            ),
-        ));
+    if out.status.success() {
+        return Ok(HcProfileOutcome::Applied);
     }
-    Ok(())
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("unrecognized subcommand 'profile'") {
+        return Ok(HcProfileOutcome::Skipped);
+    }
+    Err(PlanError::new(
+        "hc-profile-failed",
+        format!(
+            "hc profile set {profile} {key} {value} exited with {}",
+            out.status
+        ),
+    ))
 }
 
 /// Lexically normalizes `path` to an absolute path without requiring it to exist.
