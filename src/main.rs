@@ -4,6 +4,7 @@ pub mod guard;
 pub mod hc;
 pub mod hygiene;
 pub mod inspector;
+pub mod profile;
 pub mod provisioner;
 pub mod role_homes;
 pub mod runtime;
@@ -499,6 +500,37 @@ fn cmd_gate_runner(args: &[String]) {
     }
 }
 
+/// `hotpot profile set <codex|claude|pi> <supervisor|lead|peer> <model>
+/// --thinking <low|medium|high>`: the minimal write path behind the panel's
+/// inline pills and named presets — atomically updates the role profile
+/// defaults in Hotpot Home (`<HOTPOT_HOME>/profiles.json`), the file
+/// `hotpot status` serves back to the seats.
+fn cmd_profile(args: &[String]) {
+    let usage = "usage: hotpot profile set <codex|claude|pi> <supervisor|lead|peer> <model> \
+                 --thinking <low|medium|high>";
+    if args.first().map(String::as_str) != Some("set") || args.len() != 6 {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    }
+    let (agent, role, model) = (args[1].as_str(), args[2].as_str(), args[3].as_str());
+    let Some(thinking) = parse_flag(args, "--thinking").filter(|t| !t.is_empty()) else {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    };
+    let home = match resolve_hotpot_home() {
+        Ok(home) => home,
+        Err(err) => {
+            eprintln!("hotpot: {err}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(err) = profile::set(&home, agent, role, model, &thinking) {
+        eprintln!("hotpot: {err}");
+        std::process::exit(1);
+    }
+    println!("profile: set {agent}/{role} {model} · thinking {thinking}");
+}
+
 /// `hotpot auth login <codex|claude|pi> <supervisor|lead|peer>`: interactive vendor login
 /// scoped to exactly one Seat's Role Home (credentials land inside that seat only).
 fn cmd_auth(args: &[String]) {
@@ -619,6 +651,7 @@ fn main() {
             }
         }
         "auth" => cmd_auth(&args[2..]),
+        "profile" => cmd_profile(&args[2..]),
         "seat" => cmd_seat(&args[2..]),
         "export" => cmd_export(&args[2..]),
         "gate-runner" => cmd_gate_runner(&args[2..]),
@@ -626,6 +659,7 @@ fn main() {
             println!("hotpot 0.1.0 — Rust SLP verification engine & session inspector for Herdr");
             println!("Commands: status, inspect, hook, mcp, setup [--apply], verify, remove [--apply],");
             println!("           auth login <codex|claude|pi> <supervisor|lead|peer>,");
+            println!("           profile set <codex|claude|pi> <supervisor|lead|peer> <model> --thinking <low|medium|high>,");
             println!("           seat launch <supervisor|lead|peer> --agent <codex|claude|pi> --project <path>,");
             println!("           export <project> --out <path>");
         }
