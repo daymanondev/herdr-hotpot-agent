@@ -1,13 +1,19 @@
 pub mod guard;
 pub mod hc;
 pub mod inspector;
+pub mod provisioner;
 pub mod slp;
 
 use guard::{Role, evaluate_pre_tool_hook};
 use inspector::{SessionInspection, TranscriptItem};
+use provisioner::{
+    PlanError, RUNTIME_STATE_DIR, base_home_plan, find_on_path, find_role_credential_files,
+    guard_removal_root, removal_paths, resolve_hotpot_home, runtime_state_active,
+};
 use serde_json::{Value, json};
 use slp::{HotpotStatusSnapshot, MailboxEntry, SeatStatus, TaskStatus, role_scoped_mcp_tools};
 use std::env;
+use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
@@ -284,6 +290,74 @@ fn cmd_mcp(args: &[String]) {
     }
 }
 
+/// `hotpot setup [--apply]`: dry-run desired-state planning over Hotpot Home by default;
+/// `--apply` materializes exactly the planned set.
+fn cmd_setup(args: &[String]) -> Result<(), PlanError> {
+    let apply = args.iter().any(|a| a == "--apply");
+    let home = resolve_hotpot_home()?;
+    let hc_available = find_on_path("hc").is_some();
+    let plan = base_home_plan(&home, hc_available);
+    plan.validate()?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if !apply {
+        plan.print_dry_run(&mut out)
+            .map_err(|e| PlanError::new("io", format!("failed to print dry-run plan: {e}")))?;
+        return Ok(());
+    }
+    plan.apply(&mut out)
+}
+
+/// `hotpot remove [--apply]`: dry-run lists planned deletions and warns about role-owned
+/// credentials and active runtime state; `--apply` tears down the whole Hotpot Home.
+fn cmd_remove(args: &[String]) -> Result<(), PlanError> {
+    let apply = args.iter().any(|a| a == "--apply");
+    let home = resolve_hotpot_home()?;
+    if !home.exists() {
+        println!("nothing to remove: {}", home.display());
+        return Ok(());
+    }
+    guard_removal_root(&home)?;
+
+    // Warnings come before any removal listing, in dry-run and apply alike.
+    for credential in find_role_credential_files(&home) {
+        eprintln!(
+            "warning: role-owned credential file would be deleted: {}",
+            credential.display()
+        );
+    }
+    if runtime_state_active(&home) {
+        eprintln!(
+            "warning: active runtime state present ({} is non-empty); it would be deleted",
+            home.join(RUNTIME_STATE_DIR).display()
+        );
+    }
+
+    let paths = removal_paths(&home);
+    if !apply {
+        for path in &paths {
+            println!("would remove: {}", path.display());
+        }
+        println!(
+            "dry-run: nothing removed (pass --apply to tear down {})",
+            home.display()
+        );
+        return Ok(());
+    }
+
+    fs::remove_dir_all(&home).map_err(|e| {
+        PlanError::new(
+            "io",
+            format!("failed to remove {}: {e}", home.display()),
+        )
+    })?;
+    for path in paths.iter().rev() {
+        println!("removed: {}", path.display());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let sub = args.get(1).map(String::as_str).unwrap_or("status");
@@ -292,9 +366,21 @@ fn main() {
         "inspect" => cmd_inspect(&args[2..]),
         "hook" => cmd_hook(&args[2..]),
         "mcp" => cmd_mcp(&args[2..]),
+        "setup" => {
+            if let Err(err) = cmd_setup(&args[2..]) {
+                eprintln!("hotpot: {err}");
+                std::process::exit(1);
+            }
+        }
+        "remove" => {
+            if let Err(err) = cmd_remove(&args[2..]) {
+                eprintln!("hotpot: {err}");
+                std::process::exit(1);
+            }
+        }
         "--help" | "-h" | "help" => {
             println!("hotpot 0.1.0 — Rust SLP verification engine & session inspector for Herdr");
-            println!("Commands: status, inspect, hook, mcp");
+            println!("Commands: status, inspect, hook, mcp, setup [--apply], remove [--apply]");
         }
         _ => cmd_status(&args[1..]),
     }
