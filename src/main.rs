@@ -7,6 +7,7 @@ pub mod inspector;
 pub mod provisioner;
 pub mod role_homes;
 pub mod runtime;
+pub mod seats;
 pub mod skills;
 pub mod slp;
 
@@ -469,6 +470,68 @@ fn cmd_auth(args: &[String]) {
     }
 }
 
+/// `hotpot seat launch <supervisor|lead|peer> --agent <codex|claude|pi> --project <path>
+/// [--assignment <id> --parent <lead-terminal>]`: creates an `hc` terminal running the
+/// vendor CLI scoped to the seat's Role Home with the full canonical `hotpot.*` label set,
+/// reusing the Project's existing live or idle/resumable Lead and halting on duplicates.
+fn cmd_seat(args: &[String]) {
+    let usage = "usage: hotpot seat launch <supervisor|lead|peer> --agent <codex|claude|pi> \
+                 --project <path> [--assignment <id> --parent <lead-terminal>]";
+    if args.first().map(String::as_str) != Some("launch") {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    }
+    let role = match args.get(1) {
+        Some(role) => role.clone(),
+        None => {
+            eprintln!("hotpot: [usage] {usage}");
+            std::process::exit(2);
+        }
+    };
+    let Some(agent) = parse_flag(args, "--agent") else {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    };
+    let Some(project) = parse_flag(args, "--project") else {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    };
+    let assignment = parse_flag(args, "--assignment");
+    let parent = parse_flag(args, "--parent");
+    let binding = match (assignment, parent) {
+        (Some(assignment), Some(parent)) => Some(seats::PeerBinding { assignment, parent }),
+        (None, None) => None,
+        _ => {
+            eprintln!("hotpot: --assignment and --parent go together (both or neither); {usage}");
+            std::process::exit(2);
+        }
+    };
+
+    let home = match resolve_hotpot_home() {
+        Ok(home) => home,
+        Err(err) => {
+            eprintln!("hotpot: {err}");
+            std::process::exit(1);
+        }
+    };
+    let slug = runtime::project_slug(Path::new(&project));
+    match seats::launch_seat(&home, &role, &agent, Path::new(&project), binding) {
+        Ok(seats::LaunchOutcome::Launched) => {
+            println!("seat: launched {agent} {role} terminal for project {slug}");
+        }
+        Ok(seats::LaunchOutcome::Reused { address }) => {
+            println!(
+                "seat: reusing existing lead terminal {address} for project {slug}; \
+                 no new terminal created"
+            );
+        }
+        Err(err) => {
+            eprintln!("hotpot: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let sub = args.get(1).map(String::as_str).unwrap_or("status");
@@ -496,10 +559,12 @@ fn main() {
             }
         }
         "auth" => cmd_auth(&args[2..]),
+        "seat" => cmd_seat(&args[2..]),
         "--help" | "-h" | "help" => {
             println!("hotpot 0.1.0 — Rust SLP verification engine & session inspector for Herdr");
             println!("Commands: status, inspect, hook, mcp, setup [--apply], verify, remove [--apply],");
-            println!("           auth login <codex|claude|pi> <supervisor|lead|peer>");
+            println!("           auth login <codex|claude|pi> <supervisor|lead|peer>,");
+            println!("           seat launch <supervisor|lead|peer> --agent <codex|claude|pi> --project <path>");
         }
         _ => cmd_status(&args[1..]),
     }
