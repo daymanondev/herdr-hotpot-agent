@@ -40,10 +40,11 @@ impl Drop for TempDir {
 }
 
 /// Expected skeleton of the base Hotpot Home plan, derived from the spec's Provisioner Layer
-/// artifact list (`roles/<codex|claude|pi>/<supervisor|lead|peer>/` with per-vendor configs
-/// and instruction artifacts, `skills/`, `skill-projections/<agent>/lead/`, `hotpot.json`
-/// marker, `AUTHENTICATION.md`) — the independent source of truth for the dry-run assertions
-/// below.
+/// artifact list (`roles/<codex|claude|pi>/<supervisor|lead|peer>/` with per-vendor configs,
+/// instruction artifacts, and Capability Hygiene closure files — the scrubbed Codex
+/// `models.json` catalog and the Claude/Pi `launch.json` configs — plus `skills/`,
+/// `skill-projections/<agent>/lead/`, `hotpot.json` marker, `AUTHENTICATION.md`) — the
+/// independent source of truth for the dry-run assertions below.
 fn base_plan_relative_paths() -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for agent in ["codex", "claude", "pi"] {
@@ -52,15 +53,18 @@ fn base_plan_relative_paths() -> BTreeSet<String> {
             match agent {
                 "codex" => {
                     paths.insert(format!("roles/codex/{role}/config.json"));
+                    paths.insert(format!("roles/codex/{role}/models.json"));
                 }
                 "claude" => {
                     paths.insert(format!("roles/claude/{role}/mcp.json"));
                     paths.insert(format!("roles/claude/{role}/settings.json"));
                     paths.insert(format!("roles/claude/{role}/CLAUDE.md"));
+                    paths.insert(format!("roles/claude/{role}/launch.json"));
                 }
                 "pi" => {
                     paths.insert(format!("roles/pi/{role}/settings.json"));
                     paths.insert(format!("roles/pi/{role}/APPEND_SYSTEM.md"));
+                    paths.insert(format!("roles/pi/{role}/launch.json"));
                 }
                 other => panic!("unknown agent {other}"),
             }
@@ -547,8 +551,8 @@ fn setup_apply_replaces_existing_files_atomically_on_re_run() {
 }
 
 #[test]
-fn setup_and_remove_exit_nonzero_with_stderr_when_home_cannot_be_resolved() {
-    for subcommand in ["setup", "remove"] {
+fn setup_remove_and_verify_exit_nonzero_with_stderr_when_home_cannot_be_resolved() {
+    for subcommand in ["setup", "remove", "verify"] {
         let out = run_hotpot_without_home_env(&[subcommand]);
         assert!(
             !out.status.success(),

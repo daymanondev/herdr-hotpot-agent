@@ -7,6 +7,7 @@
 //! vendor's append channel, and declares its own file-backed credential and session-history
 //! paths — never symlinks into the operator's homes.
 
+use crate::hygiene;
 use crate::provisioner::PlanItem;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -42,6 +43,15 @@ fn json_file_contents(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap() + "\n"
 }
 
+/// Merges `overlay`'s top-level keys into the JSON object `base` (later keys win).
+fn merge_objects(base: &mut Value, overlay: &Value) {
+    if let (Some(base_obj), Some(overlay_obj)) = (base.as_object_mut(), overlay.as_object()) {
+        for (key, value) in overlay_obj {
+            base_obj.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 /// The seat's own credential file path (created by `hotpot auth login` / the vendor — never
 /// planned as a symlink to operator credential files).
 fn seat_credentials_file(role_home: &Path, agent: &str) -> PathBuf {
@@ -61,14 +71,17 @@ fn seat_session_history_file(role_home: &Path, agent: &str) -> PathBuf {
 }
 
 /// Plan items for one seat's Role Home: the vendor config wiring the role-scoped `hotpot mcp`
-/// server plus the agent's additive instruction artifacts. The same rendered `contract` is
-/// delivered to every agent family for a given role.
+/// server, the agent's additive instruction artifacts, and the Capability Hygiene closures
+/// (see [`hygiene`]). The same rendered `contract` is delivered to every agent family for a
+/// given role; `codex_catalog` is the already-scrubbed model catalog projected into Codex
+/// seats (ignored by the other families).
 pub fn seat_plan_items(
     home: &Path,
     hotpot_bin: &Path,
     agent: &str,
     role: &str,
     contract: &str,
+    codex_catalog: &str,
 ) -> Vec<PlanItem> {
     let role_home = role_home_dir(home, agent, role);
     let mcp = hotpot_mcp_server(hotpot_bin, home, agent, role);
@@ -78,30 +91,42 @@ pub fn seat_plan_items(
 
     match agent {
         // Codex: everything lives in `config.json`; the contract rides the additive
-        // `developer_instructions` field (no base system-prompt field is ever replaced).
+        // `developer_instructions` field (no base system-prompt field is ever replaced), and
+        // the hygiene closures disable agents/multi_agent in both config scopes. The
+        // scrubbed model catalog is projected alongside as `models.json`.
         "codex" => {
-            let config = json!({
+            let mut config = json!({
                 "mcpServers": { "hotpot": mcp },
                 "developer_instructions": contract,
                 "credentials_file": credentials_file,
                 "session_history_file": session_history_file,
             });
-            vec![PlanItem::File {
-                path: path("config.json"),
-                contents: json_file_contents(&config),
-            }]
+            merge_objects(&mut config, &hygiene::codex_closure_settings());
+            vec![
+                PlanItem::File {
+                    path: path("config.json"),
+                    contents: json_file_contents(&config),
+                },
+                PlanItem::File {
+                    path: path("models.json"),
+                    contents: codex_catalog.to_string(),
+                },
+            ]
         }
         // Claude: `mcp.json` carries the MCP wiring; `settings.json` carries the
-        // system-prompt append channel plus the seat declarations; `CLAUDE.md` is the
-        // in-home fallback carrying the same contract.
+        // system-prompt append channel, the seat declarations, and the hygiene closures (deny
+        // list + disable flags); `CLAUDE.md` is the in-home fallback carrying the same
+        // contract; `launch.json` records the seat's launch flags (deny entries repeated).
         "claude" => {
             let mcp_json = json!({ "mcpServers": { "hotpot": mcp } });
-            let settings = json!({
+            let mut settings = json!({
                 "appendSystemPrompt": contract,
                 "env": { "CLAUDE_CONFIG_DIR": role_home },
                 "credentials_file": credentials_file,
                 "session_history_file": session_history_file,
             });
+            merge_objects(&mut settings, &hygiene::claude_closure_settings());
+            let launch = json!({ "args": hygiene::claude_deny_launch_args() });
             vec![
                 PlanItem::File {
                     path: path("mcp.json"),
@@ -115,10 +140,15 @@ pub fn seat_plan_items(
                     path: path("CLAUDE.md"),
                     contents: contract.to_string(),
                 },
+                PlanItem::File {
+                    path: path("launch.json"),
+                    contents: json_file_contents(&launch),
+                },
             ]
         }
         // Pi: `settings.json` carries the MCP wiring and seat declarations;
-        // `APPEND_SYSTEM.md` is the additive system-prompt append file.
+        // `APPEND_SYSTEM.md` is the additive system-prompt append file; `launch.json`
+        // records the closed extension launch args.
         "pi" => {
             let settings = json!({
                 "mcpServers": { "hotpot": mcp },
@@ -127,6 +157,10 @@ pub fn seat_plan_items(
                 "session_history_file": session_history_file,
             });
             vec![
+                PlanItem::File {
+                    path: path("launch.json"),
+                    contents: hygiene::pi_launch_config_contents(),
+                },
                 PlanItem::File {
                     path: path("settings.json"),
                     contents: json_file_contents(&settings),
