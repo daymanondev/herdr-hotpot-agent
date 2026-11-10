@@ -24,6 +24,7 @@ use crate::hc::{self, HcTerminalSummary};
 use crate::hygiene;
 use crate::provisioner::{PlanError, find_on_path};
 use crate::role_homes::{role_home_dir, seat_correlation};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// The canonical version marker carried by every hotpot-created `hc` terminal.
@@ -113,12 +114,46 @@ fn reusable(terminal: &HcTerminalSummary) -> bool {
     }
 }
 
-/// Existing live or idle/resumable Lead terminals for the Project (discovered by labels).
-fn reusable_leads(slug: &str) -> Result<Vec<HcTerminalSummary>, PlanError> {
+/// Terminal addresses of Leads archived by a completed quiet-point replacement
+/// (the `lead_archived { terminal }` runtime ledger events, ticket 11). An
+/// archived Lead's terminal is never a reuse candidate: the successor, not the
+/// archived terminal, is the Project's Lead.
+pub fn archived_lead_addresses(home: &Path, slug: &str) -> Vec<String> {
+    let ledger = crate::runtime::Ledger::at(
+        home.join("runtime")
+            .join("v1")
+            .join(slug)
+            .join("ledger.jsonl"),
+    );
+    ledger
+        .read_events()
+        .iter()
+        .filter(|e| e.get("type").and_then(Value::as_str) == Some("lead_archived"))
+        .filter_map(|e| e.get("terminal").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Existing live or idle/resumable Lead terminals for the Project (discovered
+/// by labels), excluding terminals archived by a completed Lead replacement.
+fn reusable_leads(home: &Path, slug: &str) -> Result<Vec<HcTerminalSummary>, PlanError> {
+    let archived = archived_lead_addresses(home, slug);
     Ok(hc::list_terminals_strict()?
         .into_iter()
         .filter(|t| is_seat_terminal(t, slug, "lead") && reusable(t))
+        .filter(|t| !archived.contains(&t.address))
         .collect())
+}
+
+/// The address of the Project's live (or idle/resumable) Lead terminal — the
+/// terminal `message_lead` addresses and a Lead replacement archives. `None`
+/// when no live Lead terminal carries the Project's labels.
+pub fn project_lead_terminal(home: &Path, slug: &str) -> Result<Option<String>, PlanError> {
+    let archived = archived_lead_addresses(home, slug);
+    Ok(hc::list_terminals_strict()?
+        .into_iter()
+        .find(|t| is_seat_terminal(t, slug, "lead") && reusable(t) && !archived.contains(&t.address))
+        .map(|t| t.address))
 }
 
 /// Assembles the full `hc run` argv (after the `run` word) for one seat terminal: persistent
@@ -216,7 +251,7 @@ pub fn launch_seat(
     // 1:1 topology guard (Lead only, per ticket 06): reuse before duplicating, halt on
     // duplicates so each Project keeps a single unambiguous technical arbiter.
     if role == "lead" {
-        let leads = reusable_leads(&slug)?;
+        let leads = reusable_leads(home, &slug)?;
         if let [only] = leads.as_slice() {
             return Ok(LaunchOutcome::Reused {
                 address: only.address.clone(),

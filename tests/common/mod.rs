@@ -106,18 +106,34 @@ impl McpProcess {
     }
 
     /// Spawns `hotpot mcp` with the session correlation pin (`--correlation`),
-    /// the server-side identity a peer seat derives its binding from.
+    /// the server-side identity a peer seat derives its assignment binding from.
     pub fn spawn_correlated(
         role: &str,
         project: &Path,
         home: &Path,
         correlation: Option<&str>,
     ) -> Self {
+        Self::spawn_with_env(role, project, home, correlation, &[])
+    }
+
+    /// Spawns `hotpot mcp` with extra environment variables — the injectable
+    /// seams the attention and replacement slices ride on (`HOTPOT_NOW` clock,
+    /// `HOTPOT_HC` fake runner, a sandboxed `PATH` with fake vendor binaries).
+    pub fn spawn_with_env(
+        role: &str,
+        project: &Path,
+        home: &Path,
+        correlation: Option<&str>,
+        envs: &[(&str, &str)],
+    ) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_hotpot"));
         cmd.args(["mcp", "--role", role])
             .arg("--project")
             .arg(project)
             .env("HOTPOT_HOME", home);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         if let Some(correlation) = correlation {
             cmd.arg("--correlation").arg(correlation);
         }
@@ -241,7 +257,6 @@ pub fn ledger_line_count(home: &Path) -> usize {
 /// Appends an event line to the ledger the way a later runtime slice (peer `ask` /
 /// `handoff`, ticket 09) will write it: `seq` continues the strictly increasing count.
 pub fn seed_ledger_event(home: &Path, mut event: Value) {
-    use std::io::Write as _;
     let path = ledger_path(home);
     let next = ledger_lines(home)
         .iter()
@@ -252,6 +267,62 @@ pub fn seed_ledger_event(home: &Path, mut event: Value) {
     event["seq"] = json!(next);
     event["ts"] = json!(0);
     let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(file, "{event}").unwrap();
+}
+
+/// The canonical `<basename>-<sha1(gitRoot)[0..6]>` slug of `repo`, computed through
+/// `shasum` (an SHA-1 implementation independent of the Rust engine's own) so tests
+/// can disagree with the product's `runtime::project_slug`.
+pub fn expected_slug(repo: &Path) -> String {
+    let canonical = repo.canonicalize().unwrap();
+    let base = canonical.file_name().unwrap().to_str().unwrap();
+    let out = Command::new("shasum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(canonical.to_string_lossy().as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("shasum runs");
+    let digest = String::from_utf8_lossy(&out.stdout);
+    let hex: String = digest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    assert_eq!(hex.len(), 40, "shasum produced a full SHA-1 hex digest");
+    format!("{base}-{}", &hex[..6])
+}
+
+/// Appends a hand-written fixture event to the project ledger with an explicit
+/// unix-seconds `ts` (the injectable-clock domain) — the seam the attention
+/// detection consumes (ticket 11). Creates the ledger file if it does not exist
+/// yet, so pure-fixture ledgers need no earlier MCP append.
+pub fn seed_ledger_event_at(home: &Path, repo: &Path, mut event: Value, ts: u64) {
+    let dir = home
+        .join("runtime")
+        .join("v1")
+        .join(expected_slug(repo));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ledger.jsonl");
+    let next = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|e| e.get("seq").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    event["seq"] = json!(next);
+    event["ts"] = json!(ts);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
     writeln!(file, "{event}").unwrap();
 }
 

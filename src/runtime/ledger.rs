@@ -24,6 +24,20 @@
 //! - `assignment_abandoned`  { assignment }
 //! - `assignment_closed`     { assignment }
 //!
+//! Event types written by the attention & Lead-replacement slice (ticket 11;
+//! the attention conditions over them are specified in [`super::attention`]):
+//! - `permission_requested`  { permission, assignment?, detail? } (fixture/hook seam; stalled past 5 minutes without a resolve)
+//! - `permission_resolved`   { permission }
+//! - `lead_message`          { text } (a `NEEDS-HUMAN:` / `INCIDENT:` line raises a letter)
+//! - `context_usage`         { seat, tokens } (the Lead crossing 150k tokens raises the rotation letter)
+//! - `attention_delivered`   { key } (recorded by `room_status`; drives per-key rate suppression)
+//! - `attention_feedback`    { key, action: mute|snooze|downrank, forSeconds? }
+//! - `message_to_lead`       { from, message } (the durable Supervisor→Lead mailbox event)
+//! - `lead_replace_prepared` { replacement, draft, handoffText }
+//! - `lead_archived`         { replacement, terminal? } (also read by the seat launcher: archived leads are never reused)
+//! - `lead_replace_confirmed` { replacement, handoffText, seedRecord, successorAgent, successorCorrelation }
+//! - `lead_replace_cancelled` { replacement }
+//!
 //! Unknown event types and unparsable lines are skipped on replay so newer runtime
 //! versions never corrupt older projections (preserve-only across setup runs).
 
@@ -32,6 +46,21 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The runtime clock in unix seconds. `HOTPOT_NOW` (a unix-seconds integer)
+/// overrides the wall clock — the injectable clock the attention detection and
+/// its tests ride on; unset or unparsable values fall back to the system time.
+pub fn now_secs() -> u64 {
+    if let Some(raw) = std::env::var("HOTPOT_NOW").ok().filter(|v| !v.trim().is_empty())
+        && let Some(injected) = raw.trim().parse::<u64>().ok()
+    {
+        return injected;
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Ledger I/O failure surfaced as a JSON-RPC internal error by the dispatcher.
 #[derive(Debug)]
@@ -169,14 +198,12 @@ impl Ledger {
             .collect()
     }
 
-    /// Appends one event with the next strictly increasing `seq` and a unix `ts`.
-    /// The file is opened in append mode only — the ledger never shrinks.
+    /// Appends one event with the next strictly increasing `seq` and a unix `ts`
+    /// stamped by the runtime clock ([`now_secs`]). The file is opened in append
+    /// mode only — the ledger never shrinks.
     pub fn append(&self, mut event: Value) -> Result<u64, LedgerError> {
         let next = self.next_seq();
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let ts = now_secs();
         event["seq"] = json!(next);
         event["ts"] = json!(ts);
         let mut file = OpenOptions::new()
