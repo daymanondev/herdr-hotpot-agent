@@ -245,8 +245,7 @@ fn temp_sibling(path: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let sibling = path.with_file_name(format!("{file_name}.hotpot-tmp.{}", std::process::id()));
-    sibling
+    path.with_file_name(format!("{file_name}.hotpot-tmp.{}", std::process::id()))
 }
 
 /// Writes `contents` to `path` atomically: a temporary sibling is written first and then
