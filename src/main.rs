@@ -563,13 +563,86 @@ fn cmd_auth(args: &[String]) {
     }
 }
 
+/// `hotpot attention feedback <att_id> <useful|noisy> [--workspace <path>] [--state-dir <dir>]`:
+/// the UI-facing write path for Attention Letter feedback (the panel's Ack /
+/// Dismiss buttons) — records one `attention_feedback` event into the Project
+/// ledger without an open MCP stdio session, mapping the panel's vocabulary onto
+/// the runtime's existing actions so every subsequent `hotpot status` batch and
+/// `room_status` delivery honors it: `noisy` → `mute` (silence the key),
+/// `useful` → `snooze` (acknowledged; suppressed for the rate window).
+fn cmd_attention(args: &[String]) {
+    let usage = "usage: hotpot attention feedback <att_id> <useful|noisy> \
+                 [--workspace <path>] [--state-dir <dir>]";
+    if args.first().map(String::as_str) != Some("feedback") {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    }
+    // Positionals ride between value-taking flags; anything else is a usage
+    // error so unknown forms fail closed like the rest of the CLI.
+    let value_flags = ["--workspace", "--state-dir"];
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut rest: &[String] = &args[1..];
+    while let Some((arg, tail)) = rest.split_first() {
+        if !arg.starts_with("--") {
+            positionals.push(arg);
+            rest = tail;
+        } else if !value_flags.contains(&arg.as_str()) {
+            eprintln!("hotpot: [usage] {usage} (unknown flag `{arg}`)");
+            std::process::exit(2);
+        } else if tail.is_empty() {
+            eprintln!("hotpot: [usage] {usage} (`{arg}` requires a value)");
+            std::process::exit(2);
+        } else {
+            rest = &tail[1..];
+        }
+    }
+    if positionals.len() != 2 {
+        eprintln!("hotpot: [usage] {usage}");
+        std::process::exit(2);
+    }
+    let (att_id, action) = (positionals[0], positionals[1]);
+    let mapped = match action {
+        "noisy" => "mute",
+        "useful" => "snooze",
+        _ => {
+            eprintln!("hotpot: [usage] {usage}");
+            std::process::exit(2);
+        }
+    };
+    // The letter-key shape every detection stamps: `att_<kind>_<discriminator>`.
+    if att_id.strip_prefix("att_").is_none_or(|id| {
+        id.is_empty() || id.chars().any(char::is_whitespace)
+    }) {
+        eprintln!("hotpot: [usage] {usage} (`{att_id}` is not an att_<id> letter key)");
+        std::process::exit(2);
+    }
+
+    let workspace = parse_flag(args, "--workspace").unwrap_or_else(|| ".".to_string());
+    let home = state_dir_from(args);
+    let slug = runtime::project_slug(Path::new(&workspace));
+    let ledger = runtime::Ledger::at(ledger_path_for(&home, &slug));
+    if let Err(e) = ledger
+        .ensure_parent_dir()
+        .and_then(|_| ledger.append(json!({"type": "attention_feedback", "key": att_id, "action": mapped})))
+    {
+        eprintln!("hotpot: failed to record the feedback event: {e}");
+        std::process::exit(1);
+    }
+    println!("attention: {att_id} marked {action} ({mapped})");
+}
+
 /// `hotpot seat launch <supervisor|lead|peer> --agent <codex|claude|pi> --project <path>
-/// [--assignment <id> --parent <lead-terminal>]`: creates an `hc` terminal running the
-/// vendor CLI scoped to the seat's Role Home with the full canonical `hotpot.*` label set,
-/// reusing the Project's existing live or idle/resumable Lead and halting on duplicates.
+/// [--assignment <id> --parent <lead-terminal>] [--prompt <text>]`: creates an `hc`
+/// terminal running the vendor CLI scoped to the seat's Role Home with the full canonical
+/// `hotpot.*` label set, reusing the Project's existing live or idle/resumable Lead and
+/// halting on duplicates. `--prompt` additionally delivers an initial directive into the
+/// launched or reused seat's terminal (`hc send`, best-effort and honestly reported) and
+/// records it in the runtime ledger so the next `hotpot status` mailbox and `hotpot
+/// inspect` surface it (ticket nui/04).
 fn cmd_seat(args: &[String]) {
     let usage = "usage: hotpot seat launch <supervisor|lead|peer> --agent <codex|claude|pi> \
-                 --project <path> [--assignment <id> --parent <lead-terminal>]";
+                 --project <path> [--assignment <id> --parent <lead-terminal>] \
+                 [--prompt <text>]";
     if args.first().map(String::as_str) != Some("launch") {
         eprintln!("hotpot: [usage] {usage}");
         std::process::exit(2);
@@ -589,6 +662,14 @@ fn cmd_seat(args: &[String]) {
         eprintln!("hotpot: [usage] {usage}");
         std::process::exit(2);
     };
+    // An empty directive is a usage error, not a silent no-op.
+    let prompt = parse_flag(args, "--prompt");
+    if args.iter().any(|a| a == "--prompt")
+        && prompt.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        eprintln!("hotpot: [usage] {usage} (--prompt requires a non-empty directive text)");
+        std::process::exit(2);
+    }
     let assignment = parse_flag(args, "--assignment");
     let parent = parse_flag(args, "--parent");
     let binding = match (assignment, parent) {
@@ -608,19 +689,41 @@ fn cmd_seat(args: &[String]) {
         }
     };
     let slug = runtime::project_slug(Path::new(&project));
-    match seats::launch_seat(&home, &role, &agent, Path::new(&project), binding) {
+    let outcome = match seats::launch_seat(&home, &role, &agent, Path::new(&project), binding.clone()) {
         Ok(seats::LaunchOutcome::Launched) => {
             println!("seat: launched {agent} {role} terminal for project {slug}");
+            seats::LaunchOutcome::Launched
         }
         Ok(seats::LaunchOutcome::Reused { address }) => {
             println!(
                 "seat: reusing existing lead terminal {address} for project {slug}; \
                  no new terminal created"
             );
+            seats::LaunchOutcome::Reused { address }
         }
         Err(err) => {
             eprintln!("hotpot: {err}");
             std::process::exit(1);
+        }
+    };
+    // The initial directive (ticket nui/04): recorded durably, then delivered
+    // into the seat's terminal best-effort — a failed delivery never fails the
+    // launch, it is reported honestly instead.
+    if let Some(prompt) = prompt.as_deref() {
+        match seats::dispatch_prompt(&home, &slug, &role, &agent, &binding, &outcome, prompt) {
+            Ok(dispatch) if dispatch.delivered => {
+                let target = dispatch.target.as_deref().unwrap_or_default();
+                println!("seat: directive delivered to {target} via hc send");
+            }
+            Ok(dispatch) => eprintln!(
+                "seat: directive not delivered ({}); the directive stays recorded in \
+                 the project ledger",
+                dispatch.reason.as_deref().unwrap_or("hc send failed")
+            ),
+            Err(err) => {
+                eprintln!("hotpot: {err}");
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -659,6 +762,7 @@ fn main() {
         }
         "auth" => cmd_auth(rest),
         "profile" => cmd_profile(rest),
+        "attention" => cmd_attention(rest),
         "seat" => cmd_seat(rest),
         "export" => cmd_export(rest),
         "gate-runner" => cmd_gate_runner(rest),
@@ -667,7 +771,8 @@ fn main() {
             println!("Commands: status, inspect, hook, mcp, setup [--apply], verify, remove [--apply],");
             println!("           auth login <codex|claude|pi> <supervisor|lead|peer>,");
             println!("           profile set <codex|claude|pi> <supervisor|lead|peer> <model> --thinking <low|medium|high>,");
-            println!("           seat launch <supervisor|lead|peer> --agent <codex|claude|pi> --project <path>,");
+            println!("           attention feedback <att_id> <useful|noisy> [--workspace <path>] [--state-dir <dir>],");
+            println!("           seat launch <supervisor|lead|peer> --agent <codex|claude|pi> --project <path> [--prompt <text>],");
             println!("           export <project> --out <path>");
         }
         // Fail closed like every other subcommand: an unknown name (a typo such

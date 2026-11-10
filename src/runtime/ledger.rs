@@ -33,7 +33,7 @@
 //! - `seat_launched`         { seat, role, agent, assignment? } (written by `hotpot seat launch`; feeds the `hotpot status` seat projection, ticket 12)
 //! - `attention_delivered`   { key } (recorded by `room_status`; drives per-key rate suppression)
 //! - `attention_feedback`    { key, action: mute|snooze|downrank, forSeconds? }
-//! - `message_to_lead`       { from, message } (the durable Supervisor→Lead mailbox event)
+//! - `message_to_lead`       { from, to?, message, seat? } (the durable Supervisor→Lead mailbox event; the CLI `--prompt` directives of ticket nui/04 write it with `from: "human"`, an explicit `to` target, and the seat correlation)
 //! - `lead_replace_prepared` { replacement, draft, handoffText }
 //! - `lead_archived`         { replacement, terminal? } (also read by the seat launcher: archived leads are never reused)
 //! - `lead_replace_confirmed` { replacement, handoffText, seedRecord, successorAgent, successorCorrelation }

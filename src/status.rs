@@ -418,7 +418,14 @@ fn project_mailbox(events: &[Value], state: &RuntimeState) -> Vec<MailboxEntry> 
                     .and_then(Value::as_str)
                     .unwrap_or("supervisor")
                     .to_string(),
-                to: "lead".to_string(),
+                // The Supervisor→Lead routing events carry no `to` (the Lead is
+                // the addressee by definition); the CLI `--prompt` directives of
+                // ticket nui/04 name their target seat explicitly.
+                to: event
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .unwrap_or("lead")
+                    .to_string(),
                 kind: "directive".to_string(),
                 summary: event
                     .get("message")
