@@ -195,7 +195,8 @@ fn setup_dry_run_prints_hc_profile_change_when_fake_hc_is_on_path() {
     let home = TempDir::new("home");
     let fake_home = TempDir::new("fakehome");
     let bin = TempDir::new("bin");
-    let hc_log = TempDir::new("hclog").path().join("hc.log");
+    let hclog_dir = TempDir::new("hclog");
+    let hc_log = hclog_dir.path().join("hc.log");
     write_fake_hc(bin.path(), &hc_log);
 
     let out = run_hotpot(home.path(), fake_home.path(), Some(bin.path()), &["setup"]);
@@ -219,3 +220,96 @@ fn setup_dry_run_prints_hc_profile_change_when_fake_hc_is_on_path() {
     );
     assert!(relative_tree(home.path()).is_empty());
 }
+
+/// Parses the absolute `plan: dir|file <path>` entries out of a dry-run stdout.
+fn planned_paths_from_dry_run(stdout: &str) -> Vec<PathBuf> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("plan: "))
+        .filter_map(|rest| {
+            let (kind, path) = rest.split_once(' ')?;
+            matches!(kind, "dir" | "file").then(|| PathBuf::from(path))
+        })
+        .collect()
+}
+
+#[test]
+fn setup_apply_materializes_exactly_the_planned_set() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let sentinels = plant_operator_sentinels(fake_home.path());
+
+    let dry = run_hotpot(home.path(), fake_home.path(), None, &["setup"]);
+    assert!(dry.status.success());
+    let planned = planned_paths_from_dry_run(&stdout_of(&dry));
+    assert!(!planned.is_empty());
+
+    let out = run_hotpot(home.path(), fake_home.path(), None, &["setup", "--apply"]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+
+    // Exactly the planned set: every planned path (and only the ancestors it implies)
+    // exists under the temp home, and nothing else does.
+    let mut expected = BTreeSet::new();
+    for path in &planned {
+        let mut rel = path.strip_prefix(home.path()).unwrap().to_path_buf();
+        while !rel.as_os_str().is_empty() {
+            expected.insert(rel.to_string_lossy().into_owned());
+            if !rel.pop() {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        relative_tree(home.path()),
+        expected,
+        "apply must materialize exactly the planned paths"
+    );
+    for path in &planned {
+        assert!(path.exists(), "planned path missing after apply: {path:?}");
+    }
+
+    // Operator homes are strictly read-only inputs, and the default ~/.hotpot under the
+    // fake HOME must never be created while HOTPOT_HOME points elsewhere.
+    assert_operator_sentinels_unchanged(&sentinels);
+    assert!(
+        !fake_home.path().join(".hotpot").exists(),
+        "nothing may be written under the default ~/.hotpot when HOTPOT_HOME is set"
+    );
+}
+
+#[test]
+fn setup_apply_invokes_hc_with_the_planned_profile_change() {
+    let home = TempDir::new("home");
+    let fake_home = TempDir::new("fakehome");
+    let bin = TempDir::new("bin");
+    let hclog_dir = TempDir::new("hclog");
+    let hc_log = hclog_dir.path().join("hc.log");
+    write_fake_hc(bin.path(), &hc_log);
+
+    let out = run_hotpot(
+        home.path(),
+        fake_home.path(),
+        Some(bin.path()),
+        &["setup", "--apply"],
+    );
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+
+    let log = fs::read_to_string(&hc_log).unwrap_or_default();
+    assert_eq!(
+        log,
+        "profile set hotpot hotpot.v1 true\n",
+        "apply must invoke hc with exactly the planned profile change"
+    );
+    assert!(home.path().join("hotpot.json").exists());
+}
+

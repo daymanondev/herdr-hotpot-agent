@@ -13,6 +13,7 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 /// Agent families provisioned by the base Hotpot Home plan.
 pub const AGENTS: &[&str] = &["codex", "claude", "pi"];
@@ -148,14 +149,175 @@ impl Plan {
 
     /// Materializes exactly the planned set under `home`.
     ///
-    /// Not yet implemented: driven by the next TDD cycle.
-    pub fn apply(&self, _out: &mut impl Write) -> Result<(), PlanError> {
+    /// Pre-flights every planned path shape before touching disk (no partial state), writes
+    /// files and symlinks atomically via a temporary sibling + rename, and applies `hc`
+    /// profile changes through the discovered `hc` binary.
+    pub fn apply(&self, out: &mut impl Write) -> Result<(), PlanError> {
         self.validate()?;
-        Err(PlanError::new(
-            "apply-not-implemented",
-            "setup --apply is not implemented yet",
-        ))
+        self.preflight_path_shapes()?;
+
+        for item in &self.items {
+            match item {
+                PlanItem::Dir(path) => {
+                    fs::create_dir_all(path)
+                        .map_err(|e| PlanError::new("io", format!("failed to create dir {}: {e}", path.display())))?;
+                    writeln!(out, "applied: dir {}", path.display())
+                        .map_err(|e| PlanError::new("io", format!("failed to print plan progress: {e}")))?;
+                }
+                PlanItem::File { path, contents } => {
+                    atomic_write_file(path, contents)?;
+                    writeln!(out, "applied: file {}", path.display())
+                        .map_err(|e| PlanError::new("io", format!("failed to print plan progress: {e}")))?;
+                }
+                PlanItem::Symlink { path, target } => {
+                    atomic_symlink(path, target)?;
+                    writeln!(out, "applied: link {} -> {}", path.display(), target.display())
+                        .map_err(|e| PlanError::new("io", format!("failed to print plan progress: {e}")))?;
+                }
+                PlanItem::HcProfileSet {
+                    profile,
+                    key,
+                    value,
+                } => {
+                    apply_hc_profile(profile, key, value)?;
+                    writeln!(out, "applied: hc profile set {profile} {key} {value}")
+                        .map_err(|e| PlanError::new("io", format!("failed to print plan progress: {e}")))?;
+                }
+            }
+        }
+        Ok(())
     }
+
+    /// Refuses to proceed when a planned path is already occupied by an unexpected shape
+    /// (e.g. a directory where a file is planned) — before any disk mutation happens.
+    fn preflight_path_shapes(&self) -> Result<(), PlanError> {
+        for item in &self.items {
+            match item {
+                PlanItem::Dir(path) => {
+                    if let Ok(meta) = fs::symlink_metadata(path)
+                        && !meta.is_dir()
+                    {
+                        return Err(PlanError::new(
+                            "path-shape-conflict",
+                            format!(
+                                "planned directory {} is occupied by a non-directory; refusing to overwrite",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                PlanItem::File { path, .. } => {
+                    if let Ok(meta) = fs::symlink_metadata(path)
+                        && meta.is_dir()
+                    {
+                        return Err(PlanError::new(
+                            "path-shape-conflict",
+                            format!(
+                                "planned file {} is occupied by a directory; refusing to overwrite",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                PlanItem::Symlink { path, .. } => {
+                    if let Ok(meta) = fs::symlink_metadata(path)
+                        && meta.is_dir()
+                    {
+                        return Err(PlanError::new(
+                            "path-shape-conflict",
+                            format!(
+                                "planned symlink {} is occupied by a directory; refusing to overwrite",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                PlanItem::HcProfileSet { .. } => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Temporary sibling name used for atomic file/symlink writes (`<name>.hotpot-tmp.<pid>`).
+fn temp_sibling(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let sibling = path.with_file_name(format!("{file_name}.hotpot-tmp.{}", std::process::id()));
+    sibling
+}
+
+/// Writes `contents` to `path` atomically: a temporary sibling is written first and then
+/// renamed over the destination, so a `Seat` never observes a half-written file. Any
+/// leftover temporary is removed on failure.
+fn atomic_write_file(path: &Path, contents: &str) -> Result<(), PlanError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| PlanError::new("io", format!("failed to create parent of {}: {e}", path.display())))?;
+    }
+    let tmp = temp_sibling(path);
+    if let Err(e) = fs::write(&tmp, contents) {
+        let _ = fs::remove_file(&tmp);
+        return Err(PlanError::new(
+            "io",
+            format!("failed to write temp sibling {}: {e}", tmp.display()),
+        ));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(PlanError::new(
+            "io",
+            format!("failed to rename {} over {}: {e}", tmp.display(), path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Points `path` at `target` atomically (temporary sibling symlink, then rename).
+fn atomic_symlink(path: &Path, target: &Path) -> Result<(), PlanError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| PlanError::new("io", format!("failed to create parent of {}: {e}", path.display())))?;
+    }
+    let tmp = temp_sibling(path);
+    if let Err(e) = std::os::unix::fs::symlink(target, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(PlanError::new(
+            "io",
+            format!("failed to create temp symlink {}: {e}", tmp.display()),
+        ));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(PlanError::new(
+            "io",
+            format!("failed to rename {} over {}: {e}", tmp.display(), path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Applies an `hc profile set` change through the `hc` binary discovered on `PATH`.
+fn apply_hc_profile(profile: &str, key: &str, value: &str) -> Result<(), PlanError> {
+    let hc = find_on_path("hc").ok_or_else(|| {
+        PlanError::new(
+            "hc-not-found",
+            "hc is not on PATH; cannot apply the planned hc profile change",
+        )
+    })?;
+    let status = Command::new(&hc)
+        .args(["profile", "set", profile, key, value])
+        .status()
+        .map_err(|e| PlanError::new("io", format!("failed to invoke hc profile set: {e}")))?;
+    if !status.success() {
+        return Err(PlanError::new(
+            "hc-profile-failed",
+            format!("hc profile set {profile} {key} {value} exited with {status}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Lexically normalizes `path` to an absolute path without requiring it to exist.
