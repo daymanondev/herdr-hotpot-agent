@@ -9,7 +9,7 @@
 // prompt box to the seat's terminal. Zero emoji characters: every icon is a
 // vector chrome glyph or a vendor icon descriptor.
 
-import { View, div, svg, image } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
 import {
   exec,
@@ -39,10 +39,11 @@ import {
   ptyTarget,
   toolCallCollapsedModel,
   inspectorHeaderModel,
-  agentIconModel,
-  ROTATION_MARK_TOKENS,
-  formatTokenCount,
 } from "./protocol.js";
+import {
+  renderContextBar as contextBarElement,
+  renderIconDescriptor as iconDescriptorElement,
+} from "./chrome.js";
 
 export default class HotpotSessionInspector extends View {
   init(_props, cx) {
@@ -203,94 +204,13 @@ export default class HotpotSessionInspector extends View {
   // Native chrome helpers (the panel's design system, ticket 06)
   // ---------------------------------------------------------------------------
 
-  warningColor(t) {
-    return t.blocked ?? t.ansi1;
-  }
-
-  // An icon descriptor rendered natively: chrome glyphs as one-color `svg`s
-  // in the given color, vendor descriptors through the 06 icon rule against
-  // Herdr's program table (`svg(icon)` tinted when `tint`, else the
-  // full-color `image(icon)`; the terminal glyph as fallback). `null`
-  // descriptors render nothing.
-  renderIconDescriptor(t, descriptor, agent, size = 12, color = null) {
-    if (!descriptor) return null;
-    if (descriptor.kind === "vendor") {
-      const icon = agentIconModel(agent, this.agentRegistry);
-      if (icon.tint) {
-        return svg(icon.icon).size(size).flex_none().text_color(t.foreground);
-      }
-      return image(icon.icon).w(size).h(size).flex_none();
-    }
-    return svg(descriptor.icon).size(size).flex_none().text_color(color ?? t.dim);
-  }
-
-  // The row's fold affordance: a native chevron pointing down while the row
-  // is expanded and right while it is collapsed.
+  // The row's fold affordance: a native chevron pointing down while the row is
+  // expanded and right while it is collapsed.
   chevronIcon(t, expanded, size = 11) {
     const icon = expanded
       ? "mods/workspace-chrome/chevron-down.svg"
       : "mods/workspace-chrome/chevron-right.svg";
     return svg(icon).size(size).flex_none().text_color(t.dim);
-  }
-
-  // The seat's context window as one geometric bar (same construction as the
-  // panel, ticket 06): a `3px` rounded track carrying proportional
-  // `Cache Read` / `Fresh Input` / `Output` fills, a `1px` warning-colored
-  // tick at the rotation mark's share of the track, and the compact `150k`
-  // badge once usage reaches the mark.
-  renderContextBar(t, bar) {
-    const segmentColors = { cacheRead: t.muted, freshInput: t.accent, output: t.dim };
-    return h_flex()
-      .id("inspector-context-bar")
-      .items_center()
-      .gap(4)
-      .children(
-        [
-          div()
-            .id("context-bar-track")
-            .relative()
-            .flex_1()
-            .h(3)
-            .rounded(1.5)
-            .overflow_hidden()
-            .bg(t.canvas)
-            .children(
-              [
-                ...bar.segments
-                  .filter((segment) => segment.fraction > 0)
-                  .map((segment) =>
-                    div()
-                      .id(`context-bar-${segment.kind}`)
-                      .h(3)
-                      .flex_grow(segment.fraction)
-                      .bg(segmentColors[segment.kind] ?? t.dim),
-                  ),
-                bar.rotationTick
-                  ? div()
-                      .id("bar-rotation-tick")
-                      .absolute()
-                      .top(0)
-                      .bottom(0)
-                      .w(1)
-                      .left(`${((100 * ROTATION_MARK_TOKENS) / bar.total).toFixed(2)}%`)
-                      .bg(this.warningColor(t))
-                  : null,
-              ].filter(Boolean),
-            ),
-          bar.rotationTick
-            ? div()
-                .id("bar-rotation-badge")
-                .px(4)
-                .rounded(4)
-                .bg(t.raised)
-                .text_size(10)
-                .font_semibold()
-                .text_color(this.warningColor(t))
-                .child(formatTokenCount(ROTATION_MARK_TOKENS))
-            : null,
-          div().text_size(10).text_color(t.muted).child(formatTokenCount(bar.total)),
-        ].filter(Boolean),
-      );
   }
 
   // ---------------------------------------------------------------------------
@@ -314,7 +234,7 @@ export default class HotpotSessionInspector extends View {
           .gap(8)
           .children(
             [
-              this.renderIconDescriptor(t, header.icon, header.agent, 14),
+              iconDescriptorElement(t, header.icon, header.agent, this.agentRegistry, 14),
               div()
                 .text_size(13)
                 .font_semibold()
@@ -394,7 +314,7 @@ export default class HotpotSessionInspector extends View {
                     ),
             ].filter(Boolean),
           ),
-        this.renderContextBar(t, header.context),
+        contextBarElement(t, header.context, "inspector-context-bar"),
       ]);
   }
 
@@ -434,7 +354,7 @@ export default class HotpotSessionInspector extends View {
             .children(
               [
                 this.chevronIcon(t, !isCollapsed),
-                this.renderIconDescriptor(t, meta.icon, agent, 12, t.accent),
+                iconDescriptorElement(t, meta.icon, agent, this.agentRegistry, 12, t.accent),
                 div().text_size(11.5).font_medium().text_color(t.dim).child(meta.label),
                 item.duration_ms
                   ? div()
@@ -495,7 +415,7 @@ export default class HotpotSessionInspector extends View {
             .children(
               [
                 this.chevronIcon(t, !model.collapsed),
-                this.renderIconDescriptor(t, meta.icon, agent, 12, t.accent),
+                iconDescriptorElement(t, meta.icon, agent, this.agentRegistry, 12, t.accent),
                 div()
                     .text_size(11.5)
                     .font_medium()
@@ -563,7 +483,7 @@ export default class HotpotSessionInspector extends View {
               // directives keep their accent label as the marker.
               item.role === "user"
                 ? null
-                : this.renderIconDescriptor(t, meta.icon, agent, 12),
+                : iconDescriptorElement(t, meta.icon, agent, this.agentRegistry, 12),
               div()
                 .text_size(11)
                 .font_semibold()

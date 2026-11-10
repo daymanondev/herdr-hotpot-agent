@@ -86,9 +86,14 @@ test("the right-hand panel carries no emoji, block bars, ALL-CAPS headings, or p
 // the geometric context bar (a 3px track with a 1px rotation tick), the
 // native spinner, and vendor icons resolved through Herdr's `knownAgents()`
 // registry (the `image()` branch renders untinted vendor icons; `svg()` the
-// tinted ones). Text stand-ins are gone: no `BAR_CELLS` cell rendering, no
-// braille spinner frames, no `●` text dots.
+// tinted ones). The context bar and the icon-descriptor rule are the shared
+// render helpers synced into each mod as `chrome.js`, so the contract scans
+// the panel's main.js plus its chrome copy — together they are what the mod
+// ships. Text stand-ins are gone: no `BAR_CELLS` cell rendering, no braille
+// spinner frames, no `●` text dots.
 // ---------------------------------------------------------------------------
+
+const PANEL_CHROME_SOURCE_URL = new URL("../../mods/hotpot/chrome.js", import.meta.url);
 
 const NATIVE_CHROME_REQUIRED = [
   [".h(3)", "the 3px context-bar track"],
@@ -106,7 +111,8 @@ const NATIVE_CHROME_FORBIDDEN = [
 ];
 
 test("the panel renders the native chrome pieces the design system names", () => {
-  const source = readFileSync(PANEL_SOURCE_URL, "utf8");
+  const source =
+    readFileSync(PANEL_SOURCE_URL, "utf8") + readFileSync(PANEL_CHROME_SOURCE_URL, "utf8");
   const missing = NATIVE_CHROME_REQUIRED.filter(([needle]) => !source.includes(needle)).map(
     ([, label]) => label,
   );
@@ -170,6 +176,8 @@ const INSPECTOR_NATIVE_SOURCES = [
   "../../mods/hotpot-session/main.js",
   "../../mods/hotpot/protocol.js",
   "../../mods/hotpot-session/protocol.js",
+  "../../mods/hotpot/chrome.js",
+  "../../mods/hotpot-session/chrome.js",
 ];
 
 function sourceHygieneOffenders(source) {
@@ -209,7 +217,12 @@ test("the session inspector and both synced protocol copies carry no emoji and n
 });
 
 test("the synced protocol copies use no browser or Node timer globals", () => {
-  for (const rel of ["../../mods/hotpot/protocol.js", "../../mods/hotpot-session/protocol.js"]) {
+  for (const rel of [
+    "../../mods/hotpot/protocol.js",
+    "../../mods/hotpot-session/protocol.js",
+    "../../mods/hotpot/chrome.js",
+    "../../mods/hotpot-session/chrome.js",
+  ]) {
     const source = readFileSync(new URL(rel, import.meta.url), "utf8");
     const offenders = source
       .split("\n")
@@ -238,7 +251,9 @@ const INSPECTOR_NATIVE_REQUIRED = [
 ];
 
 test("the session inspector renders the native redesign pieces the ticket names", () => {
-  const source = readFileSync(new URL("../../mods/hotpot-session/main.js", import.meta.url), "utf8");
+  const source =
+    readFileSync(new URL("../../mods/hotpot-session/main.js", import.meta.url), "utf8") +
+    readFileSync(new URL("../../mods/hotpot-session/chrome.js", import.meta.url), "utf8");
   const missing = INSPECTOR_NATIVE_REQUIRED.filter(([needle]) => !source.includes(needle)).map(
     ([, label]) => label,
   );

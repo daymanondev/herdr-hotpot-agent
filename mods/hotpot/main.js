@@ -30,7 +30,7 @@
 // warning tick at the `150k` rotation mark, and a non-truncating
 // `agent / model · thinking` selector that persists each click immediately.
 
-import { View, div, svg, image } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import {
   exec,
@@ -51,11 +51,9 @@ import {
   MODEL_OPTIONS,
   THINKING_OPTIONS,
   PRESET_PROFILES,
-  ROTATION_MARK_TOKENS,
   activeSpace,
   spaceFolder,
   hotpotExecOptions,
-  agentIconModel,
   applyPickerPatch,
   seatStatusMarker,
   markerToneColor,
@@ -63,7 +61,6 @@ import {
   attentionFeedbackArgs,
   attentionSeatTarget,
   contextBarModel,
-  formatTokenCount,
   profileSetArgs,
   parseHotpotJson,
   statusColor,
@@ -75,10 +72,11 @@ import {
   onboardingChipModel,
   onboardingDispatchSteps,
 } from "./protocol.js";
-
-function warningColor(t) {
-  return t.blocked ?? t.ansi1;
-}
+import {
+  warningColor,
+  renderContextBar as contextBarElement,
+  renderIconDescriptor as iconDescriptorElement,
+} from "./chrome.js";
 
 export default class HotpotPanel extends View {
   init(_props, cx) {
@@ -459,16 +457,13 @@ export default class HotpotPanel extends View {
       });
   }
 
-  // The agent's icon from Herdr's program table (`knownAgents()`): a
+  // The agent's icon from Herdr's program table (`knownAgents()`): the shared
+  // icon-descriptor rule from `chrome.js` over the panel's registry — a
   // one-color glyph drawn in the row's color when the entry tints, else the
   // vendor's own full-color picture. Agents the registry lacks — or slots
   // with no configured agent yet — fall back to the terminal glyph.
   vendorIcon(t, agent, size = 13) {
-    const icon = agentIconModel(agent, this.agentRegistry);
-    if (icon.tint) {
-      return svg(icon.icon).size(size).flex_none().text_color(t.foreground);
-    }
-    return image(icon.icon).w(size).h(size).flex_none();
+    return iconDescriptorElement(t, { kind: "vendor" }, agent, this.agentRegistry, size);
   }
 
   // The quiet geometric state marker of one seat row (spec "Native Herdr
@@ -780,64 +775,11 @@ export default class HotpotPanel extends View {
   }
 
   // The seat's context window as one geometric bar (spec "Geometric Context
-  // Bar"): a `3px` rounded track carrying proportional `Cache Read` /
-  // `Fresh Input` / `Output` fills, a `1px` warning-colored tick at the
-  // rotation mark's share of the track, and the compact `150k` badge once
-  // usage reaches the mark. The quiet token total stays on the right.
+  // Bar"): the shared construction from `chrome.js` over this seat's context
+  // model — proportional fills, the rotation-mark tick, the `150k` badge, and
+  // the quiet token total.
   renderContextBar(t, context) {
-    const bar = contextBarModel(context);
-    const segmentColors = { cacheRead: t.muted, freshInput: t.accent, output: t.dim };
-    return h_flex()
-      .id("seat-context-bar")
-      .items_center()
-      .gap(4)
-      .children(
-        [
-          div()
-            .id("context-bar-track")
-            .relative()
-            .flex_1()
-            .h(3)
-            .rounded(1.5)
-            .overflow_hidden()
-            .bg(t.canvas)
-            .children(
-              [
-                ...bar.segments
-                  .filter((segment) => segment.fraction > 0)
-                  .map((segment) =>
-                    div()
-                      .id(`context-bar-${segment.kind}`)
-                      .h(3)
-                      .flex_grow(segment.fraction)
-                      .bg(segmentColors[segment.kind] ?? t.dim),
-                  ),
-                bar.rotationTick
-                  ? div()
-                      .id("bar-rotation-tick")
-                      .absolute()
-                      .top(0)
-                      .bottom(0)
-                      .w(1)
-                      .left(`${((100 * ROTATION_MARK_TOKENS) / bar.total).toFixed(2)}%`)
-                      .bg(warningColor(t))
-                  : null,
-              ].filter(Boolean),
-            ),
-          bar.rotationTick
-            ? div()
-                .id("bar-rotation-badge")
-                .px(4)
-                .rounded(4)
-                .bg(t.raised)
-                .text_size(10)
-                .font_semibold()
-                .text_color(warningColor(t))
-                .child(formatTokenCount(ROTATION_MARK_TOKENS))
-            : null,
-          div().text_size(10).text_color(t.muted).child(formatTokenCount(bar.total)),
-        ].filter(Boolean),
-      );
+    return contextBarElement(t, contextBarModel(context), "seat-context-bar");
   }
 
   renderSeatSlot(t, slot, selectedId, cx) {
